@@ -11614,7 +11614,7 @@ static inline void tileCacheMkdir(const char* rel) {
 // 4.75 MB partition holds a couple hundred.
 #if defined(MULTI_TRANSPORT_COMPANION)
 struct TileFetchReq { uint8_t z; int32_t x; int32_t y; };
-static constexpr int     k_tile_fetch_queue_size = 32;
+static constexpr int     k_tile_fetch_queue_size = 64;   // holds a full zoomed-out prefetch pyramid + the visible grid in one pass
 static QueueHandle_t     s_tile_fetch_queue   = nullptr;
 static TaskHandle_t      s_tile_fetch_task    = nullptr;
 static volatile bool     s_tile_fetch_dirty   = false;
@@ -11636,9 +11636,9 @@ static volatile bool     s_tile_fetch_spawn_ok = false;
 // unreadable. Negative values come from HTTPClient itself.
 static volatile int16_t  s_tile_fetch_last_code = 0;
 // Recently-queued dedup ring — prevents the same (z,x,y) being enqueued
-// dozens of times on rapid pan. 16 entries is enough for the 9 visible
-// tiles + recent history.
-static constexpr int     k_tile_fetch_dedup_size = 16;
+// dozens of times on rapid pan. Sized to cover one full pass: the 9 visible
+// tiles + the ~20-tile zoomed-out prefetch pyramid + a little history.
+static constexpr int     k_tile_fetch_dedup_size = 48;   // wide prefetch queues ~30 tiles/location; keep them all deduped
 static uint32_t          s_tile_fetch_dedup[k_tile_fetch_dedup_size] = {0};
 static int               s_tile_fetch_dedup_head = 0;
 
@@ -12254,34 +12254,56 @@ static void queueTileForFetch(uint8_t z, int32_t x, int32_t y) {
   }
 }
 
-// "Zoom packs": for the settled map center, opportunistically cache the tile
-// at the min and max zoom (a wide overview + a close detail) through the same
-// background fetch path as the live map — so every place you browse online is
-// kept for offline use at two zoom levels, not just the one you're viewing.
-// Two tiles per location; queueTileForFetch's Wi-Fi guard + dedup ring and the
-// on-disk checks here keep it cheap, and because it runs *after* the visible
-// tiles are queued, FIFO ordering means the tiles you're actually looking at
-// always download first.
+// "Zoom packs": for the settled map center, opportunistically cache a zoomed-out
+// pyramid AROUND the center through the same background fetch path as the live map
+// — so every place you browse online stays usable offline across a wide range of
+// zooms, not just the one level you happened to be viewing. Low-zoom tiles each
+// cover a huge area, so a 3x3 grid at z7/z8/z9 is only a handful of tiles yet
+// covers a province → the whole country → across the borders. Cheap because
+// queueTileForFetch's Wi-Fi guard + dedup ring + the on-disk checks here skip
+// anything already cached, and because it runs *after* the visible tiles are
+// queued, FIFO ordering means the tiles you're actually looking at download first.
 static void queueZoomPackForCenter() {
   if (s_map_center_lat == 0.0 && s_map_center_lon == 0.0) return;
   if (!s_tiles_fs_ready) return;
-  // Cache a moderate overview + detail pair for offline use — NOT the wide manual
-  // min/max (we don't want every recenter prefetching a continent z3 + a building
-  // z19 tile). Centred on the default zoom.
-  const uint8_t levels[2] = { (uint8_t)(k_map_zoom_default - 2), (uint8_t)(k_map_zoom_default + 2) };
-  for (int i = 0; i < 2; ++i) {
-    const uint8_t z = levels[i];
-    if (z == s_map_zoom) continue;            // current zoom: renderMapTiles already queues it
+  // Don't thrash a near-full cache: the wide prefetch below would just download
+  // tiles the partition can't hold. The visible-tile fetches in renderMapTiles are
+  // NOT gated by this, so the spot you're looking at always still tries to cache.
+  if (s_tiles_fs.totalBytes() > 0 &&
+      (s_tiles_fs.totalBytes() - s_tiles_fs.usedBytes()) < (512u * 1024u)) return;
+  // Span across a 3x3 grid at Belgium's latitude (~50.8N): z7 ~590 km (country +
+  // all borders), z8 ~295 km (whole country), z9 ~145 km (a province). Plus a
+  // single close overview (z12, town) + detail (z16, street) tile for the exact
+  // spot. r = tiles each side of center (0 = just the center tile).
+  struct ZoomPack { uint8_t z; int8_t r; };
+  static const ZoomPack packs[] = {
+    { 7, 1 },                                  // country + all borders
+    { 8, 1 },                                  // whole country
+    { 9, 1 },                                  // a province
+    { (uint8_t)(k_map_zoom_default - 2), 0 },  // z12 town overview
+    { (uint8_t)(k_map_zoom_default + 2), 0 },  // z16 street detail
+  };
+  for (uint8_t p = 0; p < sizeof(packs) / sizeof(packs[0]); ++p) {
+    const uint8_t z = packs[p].z;
+    if (z == s_map_zoom) continue;            // current zoom: renderMapTiles already queues the visible grid
+    const int8_t  r    = packs[p].r;
+    const int32_t span = (int32_t)1 << z;     // tiles per axis at this zoom (wrap guard)
     double wx, wy;
     latLonToWorldPx(s_map_center_lat, s_map_center_lon, z, &wx, &wy);
-    const int32_t tx = (int32_t)floor(wx / 256.0);
-    const int32_t ty = (int32_t)floor(wy / 256.0);
-    char path[48];
-    snprintf(path, sizeof path, "/tiles/%u/%ld/%ld.jpg", (unsigned)z, (long)tx, (long)ty);
-    if (tileCacheExists(path)) continue;    // already have an offline pack tile
-    snprintf(path, sizeof path, "/tiles/%u/%ld/%ld.png", (unsigned)z, (long)tx, (long)ty);
-    if (tileCacheExists(path)) continue;    // already Wi-Fi-fetched
-    queueTileForFetch(z, tx, ty);
+    const int32_t ctx = (int32_t)floor(wx / 256.0);
+    const int32_t cty = (int32_t)floor(wy / 256.0);
+    for (int8_t dy = -r; dy <= r; ++dy) {
+      for (int8_t dx = -r; dx <= r; ++dx) {
+        const int32_t tx = ctx + dx, ty = cty + dy;
+        if (tx < 0 || ty < 0 || tx >= span || ty >= span) continue;  // off the world edge
+        char path[48];
+        snprintf(path, sizeof path, "/tiles/%u/%ld/%ld.jpg", (unsigned)z, (long)tx, (long)ty);
+        if (tileCacheExists(path)) continue;  // already have an offline pack tile
+        snprintf(path, sizeof path, "/tiles/%u/%ld/%ld.png", (unsigned)z, (long)tx, (long)ty);
+        if (tileCacheExists(path)) continue;  // already Wi-Fi-fetched
+        queueTileForFetch(z, tx, ty);
+      }
+    }
   }
 }
 #endif  // ESP32 && MULTI_TRANSPORT_COMPANION
