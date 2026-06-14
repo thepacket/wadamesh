@@ -1356,6 +1356,10 @@ static inline bool isMsgFloodType(uint8_t t) {
 }
 
 void MyMesh::logRxRaw(float snr, float rssi, const uint8_t raw[], int len) {
+  // Live signal for the top-bar icon: SNR of whatever we just heard, with a
+  // timestamp so the UI can dim the icon when the mesh has gone quiet.
+  _ui_sig_snr_q4 = (int8_t)(snr * 4.0f);
+  _ui_sig_ms     = millis();
 #if defined(DISPLAY_CLASS)
   // Diagnostic: log EVERY received frame so we can prove what reaches the
   // radio. Header byte layout is

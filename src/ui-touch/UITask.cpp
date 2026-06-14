@@ -482,6 +482,7 @@ struct GlobalStatusBar {
   lv_obj_t* batt_icon;
   lv_obj_t* layout_label;   // EN / BG indicator, right side
   lv_obj_t* chan_gear;      // channel-settings gear, left of the thread name (channels only)
+  lv_obj_t* sig_bars[4];    // mesh signal-strength bars (lit count = last-heard SNR)
 };
 static GlobalStatusBar g_statusbar = {};
 static void updateGlobalStatusBar();   // fwd decl, called from refresh tick
@@ -18193,6 +18194,29 @@ static void buildGlobalStatusBar() {
   lv_obj_set_style_text_font(g_statusbar.conn_icon, &g_font_12, LV_PART_MAIN);
   lv_obj_align(g_statusbar.conn_icon, LV_ALIGN_RIGHT_MID, -104, 0);
 
+  // ---- Mesh signal-strength bars (left of the conn icon) ----
+  // Four bars of increasing height; the lit count reflects the SNR of the last
+  // packet we heard (updateGlobalStatusBar recolors them). Dim = no recent RX.
+  {
+    lv_obj_t* sb = lv_obj_create(g_statusbar.root);
+    lv_obj_remove_style_all(sb);
+    lv_obj_set_size(sb, 15, 12);
+    lv_obj_align(sb, LV_ALIGN_RIGHT_MID, -126, 0);
+    lv_obj_clear_flag(sb, LV_OBJ_FLAG_SCROLLABLE);
+    const int bw = 3, gap = 1;
+    const int hh[4] = {4, 6, 9, 12};
+    for (int i = 0; i < 4; i++) {
+      lv_obj_t* b = lv_obj_create(sb);
+      lv_obj_remove_style_all(b);
+      lv_obj_set_size(b, bw, hh[i]);
+      lv_obj_set_pos(b, i * (bw + gap), 12 - hh[i]);   // bottom-aligned
+      lv_obj_set_style_radius(b, 1, LV_PART_MAIN);
+      lv_obj_set_style_bg_opa(b, LV_OPA_COVER, LV_PART_MAIN);
+      lv_obj_set_style_bg_color(b, lv_color_hex(0x33363B), LV_PART_MAIN);
+      g_statusbar.sig_bars[i] = b;
+    }
+  }
+
   // Keyboard layout indicator — sits between conn_icon and clock.
   g_statusbar.layout_label = lv_label_create(g_statusbar.root);
   lv_label_set_text(g_statusbar.layout_label, TR(""));
@@ -18289,7 +18313,10 @@ static void updateGlobalStatusBar() {
         int nchars = 0;
         for (const char* p = nm; *p; ++p) if (((uint8_t)*p & 0xC0) != 0x80) ++nchars;  // UTF-8 codepoints
         if (nchars > 11) {
-          lv_obj_set_width(g_statusbar.left_label, 100);   // ~11 chars at font_14
+          // ~11 chars on the wide T-Deck; narrower on the V4 to leave room for
+          // the new signal bars in the status row.
+          lv_obj_set_width(g_statusbar.left_label,
+                           (lv_disp_get_hor_res(nullptr) >= 300) ? 100 : 74);
           lv_label_set_long_mode(g_statusbar.left_label, LV_LABEL_LONG_SCROLL_CIRCULAR);
         } else {
           lv_obj_set_width(g_statusbar.left_label, LV_SIZE_CONTENT);
@@ -18331,6 +18358,30 @@ static void updateGlobalStatusBar() {
     lv_obj_add_flag(g_statusbar.conn_icon, LV_OBJ_FLAG_HIDDEN);
   }
 #endif
+
+  // ---- Mesh signal strength ---- (SNR of the last packet we heard; dims when
+  // nothing's been heard for a while. The periodic zero-hop "discover" advert in
+  // UITask::loop keeps it fresh by prompting nearby nodes/repeaters.)
+  {
+    const uint32_t sig_ms = the_mesh.uiSignalMs();
+    const bool stale = (sig_ms == 0) || ((millis() - sig_ms) > 300000UL);   // 5 min
+    int level = 0;
+    if (!stale) {
+      const int snr = the_mesh.uiSignalSnrQ4() / 4;   // dB
+      if      (snr >= 5)   level = 4;
+      else if (snr >= 0)   level = 3;
+      else if (snr >= -7)  level = 2;
+      else                 level = 1;   // heard something, just weak -> 1 bar
+    }
+    static int s_sig_level = -1;
+    if (level != s_sig_level) {
+      s_sig_level = level;
+      for (int i = 0; i < 4; i++)
+        if (g_statusbar.sig_bars[i])
+          lv_obj_set_style_bg_color(g_statusbar.sig_bars[i],
+              lv_color_hex(i < level ? COLOR_ACCENT : 0x33363B), LV_PART_MAIN);
+    }
+  }
 
   // ---- Battery ----
   const uint16_t mv = batteryMvSmoothed();
@@ -22292,6 +22343,17 @@ void UITask::loop() {
   serviceLockingCountdown(now);   // advance / fire the spacebar "Locking…" countdown
 #endif
   refreshLiveDiag(now);
+  // Periodic "discover" probe so the top-bar signal icon stays fresh even when
+  // idle: a light zero-hop advert announces us to nearby repeaters/nodes (not
+  // flooded -> minimal airtime). The icon reads the SNR of what we hear.
+  {
+    static unsigned long s_sig_probe_at = 8000;   // first probe ~8 s after boot
+    if ((long)(now - s_sig_probe_at) >= 0) {
+      s_sig_probe_at = now + 60000;   // every 60 s
+      sendAdvertZeroHop();
+    }
+  }
+
   versionCheckService(now);   // firmware update check (gear badge + About line)
   refreshSysInfo(now);        // live uptime / heap on the About sub-tab
   wifiScanService();          // draw Wi-Fi scan results when the worker finishes

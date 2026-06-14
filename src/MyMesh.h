@@ -394,6 +394,14 @@ public:
   bool     _last_rx_has_scope = false; // false if the packet carried no transport codes
   volatile bool _echo_dirty = false;   // a repeat was counted -> UI should refresh
 
+  // ---- Live signal strength (top-bar icon) ----
+  // Updated on EVERY received packet in logRxRaw(): the SNR (×4) + millis() at RX.
+  // The UI maps it to bars and dims them when nothing's been heard for a while.
+  int8_t   _ui_sig_snr_q4 = -128;   // SNR_dB * 4 of the last RX (-128 = nothing yet)
+  uint32_t _ui_sig_ms     = 0;      // millis() at that RX (0 = nothing heard yet)
+  int8_t   uiSignalSnrQ4() const { return _ui_sig_snr_q4; }
+  uint32_t uiSignalMs()    const { return _ui_sig_ms; }
+
   /** Fingerprint of the most-recently originated flood TXT payload (0 if none). */
   uint32_t uiLastSentFp() const { return _last_sent_fp; }
 
