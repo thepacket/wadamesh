@@ -1429,9 +1429,15 @@ void MyMesh::logRxRaw(float snr, float rssi, const uint8_t raw[], int len) {
                          rt == ROUTE_TYPE_TRANSPORT_DIRECT); // header iff route is a TRANSPORT_* one
     const int  ps     = 1 + (has_xp ? 4 : 0);
     if (ps < len) {
-      const uint8_t pb   = raw[ps];
-      const int     poff = ps + 1 + (pb & 0x3F) * (((pb >> 6) & 0x03) + 1);
-      if (poff < len) uiCountEcho(fnv1a32(raw + poff, len - poff));
+      const uint8_t pb    = raw[ps];
+      const uint8_t cnt_p = pb & 0x3F;
+      const uint8_t hsz_p = (uint8_t)(((pb >> 6) & 0x03) + 1);
+      const int     poff  = ps + 1 + cnt_p * hsz_p;
+      if (poff < len) {
+        // last path hop = the repeater whose re-flood our radio just heard
+        const uint8_t* lasthop = (cnt_p >= 1) ? (raw + poff - hsz_p) : nullptr;
+        uiCountEcho(fnv1a32(raw + poff, len - poff), lasthop, lasthop ? hsz_p : 0);
+      }
     }
   }
 #endif

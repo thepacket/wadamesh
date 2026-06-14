@@ -14823,6 +14823,23 @@ static void openMessageInfoPopup(int msg_idx) {
   if (m.outgoing && m.sent_fp) {
     blen += snprintf(body + blen, sizeof(body) - blen,
                      "\nRepeats heard: %u", (unsigned)the_mesh.uiRepeatsForFp(m.sent_fp));
+    // List the repeaters we caught echoing it (name where known, else the hash).
+    // Bounded (<= ECHO_MAX_HOPS) + hard buffer guard + read-only lookup -> no risk.
+    uint8_t rhc = the_mesh.uiRepeatHopCount(m.sent_fp);
+    for (uint8_t r = 0; r < rhc; r++) {
+      if (blen >= (int)sizeof(body) - 40) break;
+      uint8_t hh[4];
+      uint8_t hsz = the_mesh.uiRepeatHop(m.sent_fp, r, hh, sizeof(hh));
+      if (hsz == 0) continue;
+      char hashstr[9] = {0};
+      for (uint8_t b = 0; b < hsz && b < 4; ++b)
+        snprintf(hashstr + b * 2, sizeof(hashstr) - b * 2, "%02X", hh[b]);
+      char nm[21];
+      if (the_mesh.uiHopName(hh, hsz, nm, sizeof(nm)))
+        blen += snprintf(body + blen, sizeof(body) - blen, "\n  %s  %s", nm, hashstr);
+      else
+        blen += snprintf(body + blen, sizeof(body) - blen, "\n  %s", hashstr);
+    }
   }
   if (blen >= (int)sizeof(body)) blen = sizeof(body) - 1;
   body[blen] = '\0';

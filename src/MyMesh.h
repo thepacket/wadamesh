@@ -382,6 +382,10 @@ public:
   static const int UI_ECHO_SLOTS = 12;
   uint32_t _echo_fp[UI_ECHO_SLOTS]  = {0};
   uint8_t  _echo_rep[UI_ECHO_SLOTS] = {0};
+  static const int ECHO_MAX_HOPS = 3;                         // repeaters remembered per echoed send
+  uint8_t  _echo_hop[UI_ECHO_SLOTS][ECHO_MAX_HOPS][4] = {};   // last-hop hash of each distinct echo
+  uint8_t  _echo_hop_sz[UI_ECHO_SLOTS] = {0};                 // hash size used for those hops
+  uint8_t  _echo_hop_n[UI_ECHO_SLOTS]  = {0};                 // count, 0..ECHO_MAX_HOPS
   uint8_t  _echo_idx = 0;
   uint32_t _last_sent_fp = 0;
   uint8_t  _last_rx_path[32] = {0};
@@ -398,6 +402,25 @@ public:
   uint8_t uiRepeatsForFp(uint32_t fp) const {
     if (fp == 0) return 0;
     for (int i = 0; i < UI_ECHO_SLOTS; i++) if (_echo_fp[i] == fp) return _echo_rep[i];
+    return 0;
+  }
+
+  /** How many distinct repeaters we captured echoing this sent fingerprint. */
+  uint8_t uiRepeatHopCount(uint32_t fp) const {
+    if (fp == 0) return 0;
+    for (int i = 0; i < UI_ECHO_SLOTS; i++) if (_echo_fp[i] == fp) return _echo_hop_n[i];
+    return 0;
+  }
+  /** Copy the idx-th captured repeater hash for `fp` into out[] (needs >= 4 bytes);
+   *  returns the hash size (0 if none). Bounded, read-only. */
+  uint8_t uiRepeatHop(uint32_t fp, uint8_t idx, uint8_t* out, uint8_t out_sz) const {
+    if (fp == 0 || !out) return 0;
+    for (int i = 0; i < UI_ECHO_SLOTS; i++) if (_echo_fp[i] == fp) {
+      if (idx >= _echo_hop_n[i]) return 0;
+      uint8_t sz = _echo_hop_sz[i]; if (sz > out_sz) sz = out_sz; if (sz > 4) sz = 4;
+      memcpy(out, _echo_hop[i][idx], sz);
+      return sz;
+    }
     return 0;
   }
 
@@ -430,15 +453,31 @@ public:
   void uiTrackSentFp(uint32_t fp) {
     if (fp == 0) return;
     _last_sent_fp = fp;
-    for (int i = 0; i < UI_ECHO_SLOTS; i++) if (_echo_fp[i] == fp) { _echo_rep[i] = 0; return; }
-    _echo_fp[_echo_idx] = fp; _echo_rep[_echo_idx] = 0;
+    for (int i = 0; i < UI_ECHO_SLOTS; i++) if (_echo_fp[i] == fp) { _echo_rep[i] = 0; _echo_hop_n[i] = 0; return; }
+    _echo_fp[_echo_idx] = fp; _echo_rep[_echo_idx] = 0; _echo_hop_n[_echo_idx] = 0;
     _echo_idx = (uint8_t)((_echo_idx + 1) % UI_ECHO_SLOTS);
   }
 
-  /** Count one echo of fingerprint `fp` (called from logRxRaw on a match). */
-  void uiCountEcho(uint32_t fp) {
+  /** Count one echo of fingerprint `fp` (called from logRxRaw on a match). `hop`
+   *  (optional) is the re-flooding repeater's hash — the echo's last path hop —
+   *  recorded deduped + bounded so the sent-message Info can name the repeaters. */
+  void uiCountEcho(uint32_t fp, const uint8_t* hop = nullptr, uint8_t hop_sz = 0) {
     for (int i = 0; i < UI_ECHO_SLOTS; i++)
-      if (_echo_fp[i] == fp) { if (_echo_rep[i] < 255) _echo_rep[i]++; _echo_dirty = true; return; }
+      if (_echo_fp[i] == fp) {
+        if (_echo_rep[i] < 255) _echo_rep[i]++;
+        _echo_dirty = true;
+        if (hop && hop_sz > 0 && hop_sz <= 4 && _echo_hop_n[i] < ECHO_MAX_HOPS) {
+          bool seen = false;
+          for (uint8_t k = 0; k < _echo_hop_n[i]; k++)
+            if (_echo_hop_sz[i] == hop_sz && memcmp(_echo_hop[i][k], hop, hop_sz) == 0) { seen = true; break; }
+          if (!seen) {
+            memcpy(_echo_hop[i][_echo_hop_n[i]], hop, hop_sz);
+            _echo_hop_sz[i] = hop_sz;
+            _echo_hop_n[i]++;
+          }
+        }
+        return;
+      }
   }
   /** True once if a repeat was counted since the last call — the UI uses this
    *  to refresh the chat so the bubble's repeat tag updates live. */
