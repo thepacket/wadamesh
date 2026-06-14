@@ -19445,6 +19445,16 @@ static void setupWizardOpen() {
 // Called once at the end of UITask::begin: show the wizard on a fresh flash.
 static void setupWizardMaybeOpen() {
   if (touchPrefsGetSetupDone()) return;
+  // First-boot setup is Wi-Fi-only: force Bluetooth OFF and persist the choice so
+  // it stays off after setup too — the user opts BLE in later via the control
+  // center. BLE co-inits at boot from the default-on pref; tear it down here,
+  // before the UI is interactive, so the user only ever sees Wi-Fi during setup.
+  // (Already-set-up devices return above, so their BLE state is left untouched.)
+#if defined(ESP32)
+  wifiConfigSetBleEnabled(false);
+  if (g_lv.task && g_lv.task->hasBleCapability() && g_lv.task->isBleEnabled())
+    g_lv.task->disableBle();
+#endif
   setupWizardOpen();
 }
 
