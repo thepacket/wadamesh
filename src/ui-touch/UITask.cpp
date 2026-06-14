@@ -18629,6 +18629,15 @@ static void updateGlobalStatusBar() {
   }
 }
 
+// Set a label's text only when it actually changed. lv_label_set_text always
+// invalidates + re-lays-out the label (it does NOT compare), so calling it every
+// 250 ms refresh tick with byte-identical text needlessly redraws ~8 labels 4x/s.
+// Comparing against the label's CURRENT text also makes this safe across home/tab
+// rebuilds (no module-static "last value" that can outlive the widget).
+static inline void setLabelIfChanged(lv_obj_t* lbl, const char* txt) {
+  if (lbl && strcmp(lv_label_get_text(lbl), txt) != 0) lv_label_set_text(lbl, txt);
+}
+
 static void refreshStatusLabels() {
   if (!g_lv.task) return;
   // Global status bar updates every refresh — visible on every tab, so
@@ -18639,11 +18648,11 @@ static void refreshStatusLabels() {
   // CPU/RAM/PSRAM/IP line current — e.g. the IP appears/clears as Wi-Fi
   // connects/drops, without having to close and reopen the panel.
   if (s_cc_root) {
-    if (s_cc_gps_label) lv_label_set_text(s_cc_gps_label, gpsStatusStr());
+    if (s_cc_gps_label) setLabelIfChanged(s_cc_gps_label, gpsStatusStr());
     if (s_cc_sys_label) {
       char cc_sys[72];
       ccBuildSysInfo(cc_sys, sizeof cc_sys);
-      lv_label_set_text(s_cc_sys_label, cc_sys);
+      setLabelIfChanged(s_cc_sys_label, cc_sys);
     }
   }
   uint16_t active_tab = 0xFFFF;
@@ -18676,10 +18685,12 @@ static void refreshStatusLabels() {
       char sigtxt[16];
       if (sms == 0 || (millis() - sms) > 300000UL) snprintf(sigtxt, sizeof sigtxt, "Sig --");
       else snprintf(sigtxt, sizeof sigtxt, "Sig %d dB", the_mesh.uiSignalSnrQ4() / 4);
-      if (s_home_chart_sig) lv_label_set_text(s_home_chart_sig, sigtxt);
-      if (s_home_chart_legend)
-        lv_label_set_text_fmt(s_home_chart_legend, TR("TX %u  /  RX %u"),
-                              (unsigned)cur_tx, (unsigned)cur_rx);
+      if (s_home_chart_sig) setLabelIfChanged(s_home_chart_sig, sigtxt);
+      if (s_home_chart_legend) {
+        char leg[28];
+        snprintf(leg, sizeof leg, TR("TX %u  /  RX %u"), (unsigned)cur_tx, (unsigned)cur_rx);
+        setLabelIfChanged(s_home_chart_legend, leg);
+      }
     }
   }
   const bool settings_active = (active_tab == SETTINGS_TAB_INDEX);
@@ -18692,9 +18703,18 @@ static void refreshStatusLabels() {
   // downloaded tile appears. Only re-render if we're actually on the
   // map tab; otherwise let the next tab activation pick it up.
   if (s_tile_fetch_dirty && active_tab == MAP_TAB_INDEX) {
-    s_tile_fetch_dirty = false;
-    renderMapTiles();
-    renderMapMarkers();
+    // Coalesce: a Wi-Fi download burst sets this flag once per delivered tile.
+    // Re-rendering on every flag would run back-to-back full-grid tile read+decode
+    // passes on the UI thread. Cap to ~2.5x/s; leave the flag set so the next
+    // eligible tick still picks up the latest tiles (≤400 ms late, fine mid-download).
+    static uint32_t s_tile_render_ms = 0;
+    const uint32_t nowm = millis();
+    if ((uint32_t)(nowm - s_tile_render_ms) >= 400) {
+      s_tile_render_ms = nowm;
+      s_tile_fetch_dirty = false;
+      renderMapTiles();
+      renderMapMarkers();
+    }
   }
   // Line-of-sight worker result handoff (non-blocking).
   losPoll();
@@ -18707,10 +18727,11 @@ static void refreshStatusLabels() {
 #if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
     const bool ble_on = g_lv.task->hasBleCapability() && g_lv.task->isBleEnabled();
     const char* ble_suffix = ble_on ? " " LV_SYMBOL_BLUETOOTH : "";
+    char st[48];
     if (WiFi.status() == WL_CONNECTED) {
       IPAddress ip = WiFi.localIP();
-      lv_label_set_text_fmt(g_lv.home_state, LV_SYMBOL_WIFI " %d.%d.%d.%d%s",
-                            ip[0], ip[1], ip[2], ip[3], ble_suffix);
+      snprintf(st, sizeof st, LV_SYMBOL_WIFI " %d.%d.%d.%d%s",
+               ip[0], ip[1], ip[2], ip[3], ble_suffix);
     } else if (WiFi.getMode() == WIFI_STA) {
       const char* hint;
       switch (WiFi.status()) {
@@ -18722,14 +18743,15 @@ static void refreshStatusLabels() {
         case WL_NO_SHIELD:       hint = "Init…";         break;
         default:                 hint = "Connecting…";   break;
       }
-      lv_label_set_text_fmt(g_lv.home_state, LV_SYMBOL_WIFI " %s%s", hint, ble_suffix);
+      snprintf(st, sizeof st, LV_SYMBOL_WIFI " %s%s", hint, ble_suffix);
     } else if (ble_on) {
-      lv_label_set_text(g_lv.home_state, LV_SYMBOL_BLUETOOTH);
+      snprintf(st, sizeof st, "%s", LV_SYMBOL_BLUETOOTH);
     } else {
-      lv_label_set_text(g_lv.home_state, TR("Offline"));
+      snprintf(st, sizeof st, "%s", TR("Offline"));
     }
+    setLabelIfChanged(g_lv.home_state, st);
 #else
-    lv_label_set_text(g_lv.home_state,
+    setLabelIfChanged(g_lv.home_state,
                       g_lv.task->hasConnection() ? "Connected" : "Disconnected");
 #endif
   }
@@ -18743,37 +18765,29 @@ static void refreshStatusLabels() {
     const size_t ps_tot    = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
     const unsigned dram_pct = dram_tot ? (unsigned)(100 - (dram_free * 100 / dram_tot)) : 0;
     const unsigned ps_pct   = ps_tot   ? (unsigned)(100 - (ps_free   * 100 / ps_tot))   : 0;
-    lv_label_set_text_fmt(g_lv.home_stats,
-                          TR("RAM %u%%  \xC2\xB7  PSRAM %u%%"),
-                          dram_pct, ps_pct);
+    char mem[40];
+    snprintf(mem, sizeof mem, TR("RAM %u%%  \xC2\xB7  PSRAM %u%%"), dram_pct, ps_pct);
+    setLabelIfChanged(g_lv.home_stats, mem);
 #else
-    if (g_lv.home_stats) lv_label_set_text(g_lv.home_stats, TR(""));
+    setLabelIfChanged(g_lv.home_stats, TR(""));
 #endif
   }
   // Unread line (its own tappable row): mail icon + translated count.
   if (g_lv.home_unread && home_active) {
-    char ubuf[24];
+    char ubuf[24], uline[40];
     snprintf(ubuf, sizeof ubuf, TR("Unread %d"), g_lv.task->getUnreadTotal());
-    lv_label_set_text_fmt(g_lv.home_unread, LV_SYMBOL_ENVELOPE "  %s", ubuf);
+    snprintf(uline, sizeof uline, LV_SYMBOL_ENVELOPE "  %s", ubuf);
+    setLabelIfChanged(g_lv.home_unread, uline);
   }
   if (g_lv.settings_status && settings_active) {
-#if defined(ESP32)
-    lv_label_set_text_fmt(
-        g_lv.settings_status,
+    char ss[80];
+    snprintf(ss, sizeof ss,
         TR("TCP %s  BLE %s\nWS clients %d  GPS %s  Buzzer %s"),
         onOff(g_lv.task->isTcpEnabled()),
         g_lv.task->hasBleCapability() ? onOff(g_lv.task->isBleEnabled()) : "n/a",
         g_lv.task->getWsConnectedCount(),
         onOff(g_lv.task->getGPSState()), g_lv.task->isBuzzerQuiet() ? "quiet" : "on");
-#else
-    lv_label_set_text_fmt(
-        g_lv.settings_status,
-        TR("TCP %s  BLE %s\nWS clients %d  GPS %s  Buzzer %s"),
-        onOff(g_lv.task->isTcpEnabled()),
-        g_lv.task->hasBleCapability() ? onOff(g_lv.task->isBleEnabled()) : "n/a",
-        g_lv.task->getWsConnectedCount(), onOff(g_lv.task->getGPSState()),
-        g_lv.task->isBuzzerQuiet() ? "quiet" : "on");
-#endif
+    setLabelIfChanged(g_lv.settings_status, ss);
   }
   if (settings_active || g_set_modal.root) refreshSettingsSectionSubtitles();
 }
