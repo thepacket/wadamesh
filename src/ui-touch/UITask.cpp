@@ -10154,6 +10154,43 @@ static void batteryTapCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
   openBatteryChartWindow();
 }
+
+// ----- Per-node telemetry log (/telemetry/<id>.log) -----
+// One file per node (6-byte pubkey prefix, hex). Columns (tab-separated):
+//   epoch \t YYYY-MM-DD HH:MM \t battery_mv \t tempC*10 \t humidity%
+// Missing sensors use sentinels (mv=0, t10=-30000, hum=-1) -> drawn as gaps.
+// Trimmed to a 7-day window via a streaming temp-file rewrite (like battery.log).
+static const uint32_t k_telem_keep_secs = 7u * 24u * 60u * 60u;
+static void telemetryNodePath(const uint8_t* key, char* out, size_t cap) {
+  snprintf(out, cap, "/telemetry/%02X%02X%02X%02X%02X%02X.log",
+           key[0], key[1], key[2], key[3], key[4], key[5]);
+}
+static void telemetryLogAppend(const uint8_t* key, uint32_t epoch, int mv, int t10, int hum) {
+  if (SD.cardType() == CARD_NONE) return;
+  markSdIo();
+  SD.mkdir("/telemetry");
+  char path[40]; telemetryNodePath(key, path, sizeof path);
+  const char* tmp = "/telemetry/_t.tmp";
+  char when[20] = "----------------"; time_t t = (time_t)epoch; struct tm tmv;
+  if (epoch > 1700000000 && localtime_r(&t, &tmv)) strftime(when, sizeof when, "%Y-%m-%d %H:%M", &tmv);
+  File rf = SD.open(path, FILE_READ);
+  File wf = SD.open(tmp, FILE_WRITE);
+  if (!wf) { if (rf) rf.close(); return; }
+  if (rf) {
+    while (rf.available()) {
+      String ln = rf.readStringUntil('\n');
+      if (ln.length() == 0) continue;
+      const uint32_t e = (uint32_t)strtoul(ln.c_str(), nullptr, 10);
+      if (e != 0 && epoch > e && (epoch - e) > k_telem_keep_secs) continue;   // older than 7d
+      wf.print(ln); wf.print('\n');
+    }
+    rf.close();
+  }
+  wf.printf("%lu\t%s\t%d\t%d\t%d\n", (unsigned long)epoch, when, mv, t10, hum);
+  wf.close();
+  SD.remove(path);
+  SD.rename(tmp, path);
+}
 #endif  // HAS_TDECK_GT911
 
 static void refreshHomeBattery() {
@@ -23416,6 +23453,8 @@ void UITask::onTelemetryReply(const ContactInfo& contact, const uint8_t* data, s
     return (p >= 0 && (size_t)p < body_cap) ? (body_cap - (size_t)p) : 0;
   };
   bool any = false;
+  // Captured for the per-node telemetry log (sentinels = sensor absent).
+  int tl_mv = 0, tl_t10 = -30000, tl_h = -1;
   // Cap len to 0xFF so LPPReader's uint8_t length doesn't truncate weirdly.
   uint8_t rd_len = (len > 250) ? 250 : (uint8_t)len;
   LPPReader rd(data, rd_len);
@@ -23425,16 +23464,19 @@ void UITask::onTelemetryReply(const ContactInfo& contact, const uint8_t* data, s
     switch (type) {
       case LPP_VOLTAGE: {
         float v = 0; if (!rd.readVoltage(v)) goto done;
+        tl_mv = (int)(v * 1000.0f + 0.5f);
         if (bodyRoom()) p += snprintf(body + p, bodyRoom(), "%s%.2fV", sep, (double)v);
         any = true; break;
       }
       case LPP_TEMPERATURE: {
         float t = 0; if (!rd.readTemperature(t)) goto done;
+        tl_t10 = (int)lroundf(t * 10.0f);
         if (bodyRoom()) p += snprintf(body + p, bodyRoom(), "%s%.1f\xc2\xb0\x43", sep, (double)t);
         any = true; break;
       }
       case LPP_RELATIVE_HUMIDITY: {
         float h = 0; if (!rd.readRelativeHumidity(h)) goto done;
+        tl_h = (int)lroundf(h);
         if (bodyRoom()) p += snprintf(body + p, bodyRoom(), "%s%.0f%%RH", sep, (double)h);
         any = true; break;
       }
@@ -23512,6 +23554,10 @@ void UITask::onTelemetryReply(const ContactInfo& contact, const uint8_t* data, s
     if (p > 0 && (size_t)p >= body_cap - 1) break;   // body buffer full
   }
 done: {
+#if defined(HAS_TDECK_GT911)
+  // Log every reply (manual or auto-poll) to the per-node telemetry file.
+  if (any) telemetryLogAppend(contact.id.pub_key, (uint32_t)time(nullptr), tl_mv, tl_t10, tl_h);
+#endif
   // Always also include a short hex dump so we can compare what the
   // decoder produced against the raw wire bytes. Helps spot wrap/offset
   // errors and unknown LPP types in one shot.
