@@ -11912,6 +11912,7 @@ static void fmImageClose() {
   // Sync delete (not async): the lv_img references s_fm_img_buf, so the widget
   // must be gone before we free the buffer it draws from.
   if (s_fm_img_root) { lv_obj_del(s_fm_img_root); s_fm_img_root = nullptr; }  // also deletes the children below
+  lv_img_cache_invalidate_src(&s_fm_img_dsc);   // drop the cache entry before the buffer it points at is freed
   if (s_fm_img_buf)  { lvglPsramFree(s_fm_img_buf); s_fm_img_buf = nullptr; }   // decoded RGB565 (lvglPsramAlloc)
   s_fm_img_widget = s_fm_img_hdr = s_fm_img_close = s_fm_img_full = s_fm_img_hint = nullptr;
   s_fm_img_fs = false;
@@ -12032,6 +12033,10 @@ static void fmOpenImage(const char* name) {
   s_fm_img_dsc.header.h  = (uint32_t)dh;
   s_fm_img_dsc.data      = s_fm_img_buf;
   s_fm_img_dsc.data_size = (uint32_t)dw * (uint32_t)dh * sizeof(lv_color_t);
+  // s_fm_img_dsc is a reused static, so LVGL's image cache (keyed on the src
+  // pointer) would hand back the PREVIOUS image's decoded geometry/data — the
+  // "half old, half new" render. Drop the stale entry so this dsc decodes fresh.
+  lv_img_cache_invalidate_src(&s_fm_img_dsc);
   const int w = dw, h = dh;
 
   const lv_coord_t sw = lv_disp_get_hor_res(nullptr);
