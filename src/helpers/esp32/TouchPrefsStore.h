@@ -256,6 +256,8 @@ bool    touchPrefsGetEnterSends();             // Enter key sends a chat message
 void    touchPrefsSetEnterSends(bool on);
 bool    touchPrefsGetClock12h();               // 12-hour clock (default false = 24h)
 void    touchPrefsSetClock12h(bool on);
+bool    touchPrefsGetNavMenubarKeys();         // show per-tab nav hotkey letters over the menubar (default false = hidden)
+void    touchPrefsSetNavMenubarKeys(bool on);
 bool    touchPrefsGetScrollReverse();          // invert trackball/scrollball direction (default false)
 void    touchPrefsSetScrollReverse(bool on);
 bool    touchPrefsGetLockOnScreenOff();        // idle screen-off auto-locks; only a deliberate hold wakes (default false)

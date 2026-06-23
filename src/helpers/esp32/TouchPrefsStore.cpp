@@ -149,9 +149,17 @@ static void cfgSetDefaults(TouchCfg& c) {
   c.sleep_idle        = 0;      // default: idle light-sleep OFF
   { const char* d = "ertui"; for (int i = 0; i < 5; i++) c.nav_keys[i] = (uint8_t)d[i]; }  // default tab hotkeys E/R/T/U/I
   c.map_zoom_buttons  = 0;      // default: map zoom = slider
+#if defined(HAS_TANMATSU)
+  { const char* d = "wxads"; for (int i = 0; i < 6; i++) c.nav_dir_keys[i] = (uint8_t)d[i]; }  // Tanmatsu: W up/X down/A left/D right/S select; no Back letter (Esc/F-key), d[5]='\0'
+#else
   { const char* d = "wzadsq"; for (int i = 0; i < 6; i++) c.nav_dir_keys[i] = (uint8_t)d[i]; }  // default W/Z/A/D/S/Q
+#endif
   c.home_is_drawer    = 0;      // default: Home = Commander screen
+#if defined(HAS_TANMATSU)
+  c.nav_scroll_keys[0] = 'f';  c.nav_scroll_keys[1] = 'v';   // Tanmatsu scroll-up F / scroll-down V
+#else
   c.nav_scroll_keys[0] = 'f';  c.nav_scroll_keys[1] = 'c';   // default scroll-up F / scroll-down C
+#endif
 }
 
 // Persist the whole blob using the same end()/begin(RW)/put/end()/begin(RO)
@@ -1217,6 +1225,8 @@ bool touchPrefsGetEnterSends()      { if (!s_begun) touchPrefsBegin(); return s_
 void touchPrefsSetEnterSends(bool on)      { if (!s_begun) touchPrefsBegin(); prefsPutUChar("ent_send", on ? 1 : 0); }
 bool touchPrefsGetClock12h()        { if (!s_begun) touchPrefsBegin(); return s_prefs.getUChar("clk_12h", 0) != 0; }
 void touchPrefsSetClock12h(bool on)        { if (!s_begun) touchPrefsBegin(); prefsPutUChar("clk_12h", on ? 1 : 0); }
+bool touchPrefsGetNavMenubarKeys()         { if (!s_begun) touchPrefsBegin(); return s_prefs.getUChar("nav_mbk", 0) != 0; }
+void touchPrefsSetNavMenubarKeys(bool on)  { if (!s_begun) touchPrefsBegin(); prefsPutUChar("nav_mbk", on ? 1 : 0); }
 bool touchPrefsGetScrollReverse()   { if (!s_begun) touchPrefsBegin(); return s_prefs.getUChar("tb_rev", 0) != 0; }
 void touchPrefsSetScrollReverse(bool on)   { if (!s_begun) touchPrefsBegin(); prefsPutUChar("tb_rev", on ? 1 : 0); }
 bool touchPrefsGetLockOnScreenOff() { if (!s_begun) touchPrefsBegin(); return s_prefs.getUChar("lock_off", 0) != 0; }

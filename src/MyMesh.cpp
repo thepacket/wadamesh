@@ -1833,6 +1833,15 @@ ContactInfo*  MyMesh::processAck(const uint8_t *data) {
 
 void MyMesh::queueMessage(const ContactInfo &from, uint8_t txt_type, mesh::Packet *pkt,
                           uint32_t sender_timestamp, const uint8_t *extra, int extra_len, const char *text) {
+  // Clock bootstrap from a peer's send-time when we have no real clock of our own (Wi-Fi
+  // and GPS off, or not yet synced). Reliable by construction: adopt ONLY a sane epoch
+  // (~2023..2033, so the 1902/0 garbage and absurd-future values are ignored), and ONLY
+  // while our own clock still reads unset — NTP/GPS override it the instant they sync, and
+  // a clock that already reads real is never moved by the mesh.
+  if (sender_timestamp > 1700000000UL && sender_timestamp < 2000000000UL &&
+      getRTCClock()->getCurrentTime() < 1700000000UL) {
+    getRTCClock()->setCurrentTime(sender_timestamp);
+  }
   int i = 0;
   out_frame[i++] = RESP_CODE_CONTACT_MSG_RECV_V3;
   out_frame[i++] = (int8_t)(pkt->getSNR() * 4);
@@ -1981,6 +1990,12 @@ void MyMesh::onSignedMessageRecv(const ContactInfo &from, mesh::Packet *pkt, uin
 
 void MyMesh::onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Packet *pkt, uint32_t timestamp,
                                   const char *text) {
+  // Clock bootstrap from a channel peer's send-time (same sane-window + unset-only guard
+  // as queueMessage above) so a Wi-Fi/GPS-off node can still get time off public channels.
+  if (timestamp > 1700000000UL && timestamp < 2000000000UL &&
+      getRTCClock()->getCurrentTime() < 1700000000UL) {
+    getRTCClock()->setCurrentTime(timestamp);
+  }
   int i = 0;
   out_frame[i++] = RESP_CODE_CHANNEL_MSG_RECV_V3;
   out_frame[i++] = (int8_t)(pkt->getSNR() * 4);

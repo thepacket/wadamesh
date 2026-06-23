@@ -482,7 +482,17 @@ void setup() {
   // minutes — or, with frequent stalls, never. A larger ring absorbs the stalls. MUST
   // precede the core's Serial1.begin() inside sensors.begin(); setRxBufferSize is a no-op
   // once the UART is already running.
-  Serial1.setRxBufferSize(4096);
+  //
+  // Gate on gps_enabled: sensors.begin()'s GPS-detect opens Serial1 on EVERY boot —
+  // including the many V4s with no GPS module — and never calls Serial1.end(), so an
+  // unconditional 4 KB ring permanently costs ~3.8 KB of scarce internal DRAM for nothing
+  // on the GPS-off majority (the "RAM is higher now" reports). GPS-on users (who actually
+  // hit the overflow) still get the big ring; default GPS-off keeps the stock 256 B. A user
+  // who enables GPS mid-session picks it up on the next reboot (gps_enabled is persisted).
+  {
+    auto* np = the_mesh.getNodePrefs();
+    if (np && np->gps_enabled) Serial1.setRxBufferSize(4096);
+  }
 #endif
   sensors.begin();
 

@@ -214,7 +214,7 @@ private:
   void appendComposerChar(char c);
   void appendComposerText(const char* text);
   void backspaceComposerChar();
-  bool sendComposerToActiveThread();
+  bool sendComposerToActiveThread(const char* override_text);
   void markThreadsDirty(unsigned long delay_ms = 200);
   void markMsgsDirty(unsigned long delay_ms = 2000);
   void flushHistoryIfDue(unsigned long now);
@@ -285,7 +285,8 @@ public:
   void composerAppendChar(char c) { appendComposerChar(c); }
   void composerAppendText(const char* text) { appendComposerText(text); }
   void composerBackspace() { backspaceComposerChar(); }
-  bool composerSend() { return sendComposerToActiveThread(); }
+  // override_text != nullptr resends that exact text (msg action menu "Resend"); nullptr = composer draft.
+  bool composerSend(const char* override_text = nullptr) { return sendComposerToActiveThread(override_text); }
   void composerTypingMode() { _composer_action_idx = -1; }
   /** Open DM thread for mesh contact index (e.g. Chats thread list / external hooks). */
   void openMeshContactDm(uint32_t mesh_contact_index);

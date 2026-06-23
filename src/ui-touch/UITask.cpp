@@ -32,6 +32,8 @@
   #include <esp_partition.h>   // find/erase otadata to fall back to the factory(recovery) slot
   #if !defined(HAS_TANMATSU)
   #include <esp_core_dump.h>   // detect/read/erase the panic coredump for the crash-report export
+  #include <freertos/FreeRTOS.h>
+  #include <freertos/task.h>   // xTaskGetCurrentTaskHandleForCPU / pcTaskGetName — Task-WDT crash self-record
   #else
   // Tanmatsu's 16M.csv has no coredump partition yet — stub so the crash-export compiles + links.
   #include <esp_err.h>
@@ -897,6 +899,11 @@ static bool tbFingerTouchOnTabBarBlocked(uint16_t y) {
 }
 #endif
 
+#if defined(HAS_TANMATSU)
+// Keyboard-only device: nav is always on. (The trackball #if above declares this for the T-Deck.)
+static bool s_kbd_nav = true;
+#endif
+
 // ---- Panel currently linked to the keyboard (or nullptr) ----
 static LvChatPanel* s_kb_panel = nullptr;
 /** Full-width strip above the on-screen keyboard: mirrors the focused textarea so edits stay visible. */
@@ -1445,6 +1452,7 @@ static void ccBuildSysInfo(char* buf, size_t n);   // fwd-decl; defined with the
 static void closeControlCenter();   // defined in the control-center section below
 static lv_obj_t* s_power_menu   = nullptr;   // power off / reboot menu (control center)
 static void closePowerMenu();               // defined in the control-center section below
+static void openPowerMenu();                // hold the red ✕ (F1) on the Tanmatsu → power off / reboot
 #if defined(HAS_TDECK_KEYBOARD)
 // Keyboard backlight: mode 0=off, 1=on, 2=auto (on while typing, off after idle).
 static uint8_t       s_kb_bl_mode    = 2;
@@ -1520,6 +1528,14 @@ static void styleButton(lv_obj_t* obj) {
 // IMPORTANT: each caller is responsible for keeping the top-right ~32×32
 // of the card content-free (or for placing only short titles there) so
 // the X doesn't sit on top of a real button.
+// Tanmatsu: tint a close/cancel ✕ glyph red (matches the F1 / Power button). No-op on other boards.
+static inline void tanCloseRed(lv_obj_t* lbl) {
+#if defined(HAS_TANMATSU)
+  lv_obj_set_style_text_color(lbl, lv_color_hex(0xE05544), LV_PART_MAIN);
+#else
+  (void)lbl;
+#endif
+}
 static lv_obj_t* addCloseXBadge(lv_obj_t* card, lv_event_cb_t cb, void* user_data = nullptr) {
   lv_obj_t* x = lv_obj_create(card);
   lv_obj_remove_style_all(x);
@@ -1544,7 +1560,11 @@ static lv_obj_t* addCloseXBadge(lv_obj_t* card, lv_event_cb_t cb, void* user_dat
   lv_obj_t* lbl = lv_label_create(x);
   lv_label_set_text(lbl, LV_SYMBOL_CLOSE);
   lv_obj_set_style_text_font(lbl, &g_font_16, LV_PART_MAIN);
+#if defined(HAS_TANMATSU)
+  lv_obj_set_style_text_color(lbl, lv_color_hex(0xE05544), LV_PART_MAIN);   // red ✕ — matches the F1 / Power button
+#else
   lv_obj_set_style_text_color(lbl, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+#endif
   // Anchor the glyph itself to the TOP-RIGHT of the (32×32) tap area —
   // centering it made the X look like it was floating in the middle of
   // nothing. The 32×32 hit zone still extends down/left for an easy tap,
@@ -1699,6 +1719,9 @@ static void closeChatPanel(LvChatPanel* p);    // (defined far below) close an o
 static void toggleControlCenter();             // (defined far below) the top-bar "control center" dropdown
 static void homeKeyActivate();                 // (defined far below) green ○ tap: Home, or toggle drawer if already Home
 static uint32_t s_f4_down_ms = 0;              // green ○ press time — tap = Home, hold = control center
+static uint32_t s_f1_down_ms = 0;              // red ✕ press time — tap = close, hold = power menu
+static bool     s_f1_fired   = false;          // power menu already opened during this F1 hold
+static bool     s_f4_fired   = false;          // control center already opened during this F4 hold
 
 // The open chat/channel detail is a full-screen overlay on lv_scr_act (above the tabview), so the
 // keypad nav must treat IT as the focus container — else arrows hit the tab bar behind it (switching
@@ -1783,8 +1806,19 @@ static void navUnstyle(lv_obj_t* o) {
   lv_obj_invalidate(o);
 }
 
+// Keyboard-nav edit mode for text fields: when focus lands on a field it is NOT editable
+// yet — the letter-nav keys (W/A/S/D/X) keep navigating. Select/Enter starts typing; any
+// focus move (arrows / trackball / advance) drops back to navigate. Without this, landing
+// on a field trapped every letter key as a typed character — you couldn't move away.
+static bool s_nav_ta_editing = false;
+
 static void navFocusCb(lv_group_t* g) {
   lv_obj_t* f = lv_group_get_focused(g);
+  // Edit mode on focus: the chat composer auto-edits (you opened the chat to type, and the
+  // cursor shows immediately); every OTHER field starts in navigate mode so the letter-nav
+  // keys keep working — press select/Enter to edit it. Esc/Enter on an empty composer drops
+  // it back to navigate mode (handled in navPump / handleHwKey).
+  s_nav_ta_editing = (f != nullptr && (f == g_lv.ch.composer_ta || f == g_lv.dm.composer_ta));
   if (s_nav_styled && s_nav_styled != f) navUnstyle(s_nav_styled);
   s_nav_styled = nullptr;                  // old highlight (if any) is now restored; nothing styled yet
   if (!f || !s_nav_show) return;          // focus-visible: paint only while actively keyboard-navigating
@@ -1820,7 +1854,7 @@ static void navFocusCb(lv_group_t* g) {
   lv_obj_scroll_to_view(f, LV_ANIM_OFF);
 }
 
-#if defined(HAS_TDECK_TRACKBALL)
+#if defined(HAS_TDECK_TRACKBALL) || defined(HAS_TANMATSU)
 // Hide the keyboard-nav focus highlight — called when the user touches the screen or
 // clicks the trackball (pointer input takes over). The group keeps its internal focus,
 // so the next ESDFX key resumes from the same place and re-reveals the highlight.
@@ -1831,10 +1865,16 @@ static void navHideFocus() {
 
 // ---- Keyboard-nav tab hotkeys (programmable; default E/R/T/U/I) ----
 static uint8_t     s_nav_keys[5]       = { 'e','r','t','u','i' };  // per main tab [chat,contacts,home,map,settings]; loaded from prefs at boot
-static uint8_t     s_dir_keys[8]       = { 'w','z','a','d','s','q','f','c' }; // control keys: up,down,left,right,select,back,scroll-up,scroll-down; loaded from prefs at boot
+static uint8_t     s_dir_keys[8]       =
+#if defined(HAS_TANMATSU)
+  { 'w','x','a','d','s', 0, 'f','v' };  // Tanmatsu control keys: up,down,left,right,select,(no back — Esc/F-key),scroll-up,scroll-down
+#else
+  { 'w','z','a','d','s','q','f','c' };  // control keys: up,down,left,right,select,back,scroll-up,scroll-down; loaded from prefs at boot
+#endif
 static int         s_navkey_capture    = -1;                       // binding idx awaiting a new key from the settings remap: 0-4 tab, 5-12 dir (-1 = idle)
 static lv_obj_t*   s_navkey_row_val[13] = { nullptr };             // the key labels in the settings rows (0-4 tabs, 5-12 dirs); refreshed on remap
 static lv_obj_t*   s_navkey_hint[5]    = { nullptr };              // small key labels over the menubar icons (tab hotkeys only)
+static bool        s_nav_mbar_keys     = false;                    // show those menubar letter hints? pref, default false = hidden
 static const char* const kNavTabNames[5] = { "Messages", "Contacts", "Home", "Map", "Settings" };
 static const char* const kNavDirNames[8] = { "Up", "Down", "Left", "Right", "Select", "Back", "Scroll up", "Scroll down" };
 
@@ -1899,28 +1939,55 @@ static int navDirForKey(int key) {
 }
 // Scroll the focused element's nearest scrollable ancestor (a list/page) without
 // moving the focus — for the scroll-up/down keys.
+// Scroll one "page" (~two-thirds of the view) in the given direction.
+static void navScrollBy(lv_obj_t* p, bool up) {
+  const lv_coord_t room = up ? lv_obj_get_scroll_top(p) : lv_obj_get_scroll_bottom(p);
+  lv_coord_t step = lv_obj_get_height(p) * 2 / 3;
+  if (step > room) step = room;
+  lv_obj_scroll_by(p, 0, up ? step : -step, LV_ANIM_ON);
+}
+// Find the largest scrollable container under `o` that still has room to scroll the
+// requested way (the main page scroller usually wins on area).
+static void navFindScrollableRec(lv_obj_t* o, bool up, lv_obj_t** best, long* bestArea) {
+  if (!o || lv_obj_has_flag(o, LV_OBJ_FLAG_HIDDEN)) return;
+  if (lv_obj_has_flag(o, LV_OBJ_FLAG_SCROLLABLE)) {
+    const lv_coord_t room = up ? lv_obj_get_scroll_top(o) : lv_obj_get_scroll_bottom(o);
+    if (room > 0) {
+      const long area = (long)lv_obj_get_width(o) * (long)lv_obj_get_height(o);
+      if (area > *bestArea) { *bestArea = area; *best = o; }
+    }
+  }
+  const uint32_t n = lv_obj_get_child_cnt(o);
+  for (uint32_t i = 0; i < n; i++) navFindScrollableRec(lv_obj_get_child(o, i), up, best, bestArea);
+}
+// Scroll the focused element's nearest scrollable ancestor; if nothing focusable can
+// scroll (or the focus isn't inside a scroll area), fall back to the biggest scrollable
+// page on the active screen — so the scroll keys ALWAYS move the page.
 static void navScrollFocused(bool up) {
   lv_obj_t* o = s_nav_group ? lv_group_get_focused(s_nav_group) : nullptr;
-  if (!o) o = lv_scr_act();
   for (lv_obj_t* p = o; p; p = lv_obj_get_parent(p)) {
     if (!lv_obj_has_flag(p, LV_OBJ_FLAG_SCROLLABLE)) continue;
     const lv_coord_t room = up ? lv_obj_get_scroll_top(p) : lv_obj_get_scroll_bottom(p);
     if (room <= 0) continue;   // nothing to scroll that way here — try the next ancestor
-    lv_coord_t step = lv_obj_get_height(p) * 2 / 3;   // ~two-thirds of the view per press
-    if (step > room) step = room;
-    lv_obj_scroll_by(p, 0, up ? step : -step, LV_ANIM_ON);
+    navScrollBy(p, up);
     return;
   }
+  lv_obj_t* best = nullptr; long bestArea = 0;   // fallback: scroll the page regardless of focus
+  navFindScrollableRec(lv_scr_act(), up, &best, &bestArea);
+  if (best) navScrollBy(best, up);
 }
 // Small key hints over each menubar icon — shown only while keyboard nav is on.
 static void navMenubarKeysSync() {
+#if defined(HAS_TANMATSU)
+  return;   // Tanmatsu menubar uses the coloured F-key shapes, not letter hotkeys — no hints
+#endif
   if (!g_lv.tabview) return;
   lv_obj_t* bar = lv_tabview_get_tab_btns(g_lv.tabview);
   if (!bar) return;
   const int bw = lv_obj_get_width(bar);
   const int cw = bw > 0 ? bw / 5 : 0;
   for (int i = 0; i < 5; i++) {
-    if (!s_kbd_nav) { if (s_navkey_hint[i]) lv_obj_add_flag(s_navkey_hint[i], LV_OBJ_FLAG_HIDDEN); continue; }
+    if (!s_kbd_nav || !s_nav_mbar_keys) { if (s_navkey_hint[i]) lv_obj_add_flag(s_navkey_hint[i], LV_OBJ_FLAG_HIDDEN); continue; }
     if (!s_navkey_hint[i]) {
       lv_obj_t* l = lv_label_create(bar);
       lv_obj_remove_style_all(l);
@@ -2001,6 +2068,10 @@ static lv_obj_t* navOpenDropdown() {
 #if defined(HAS_TANMATSU)   // bsp-input driven; on the T-Deck navFifo is fed from the trackball instead
 static void navPump() {
   if (!s_nav_queue && (bsp_input_get_queue(&s_nav_queue) != ESP_OK || !s_nav_queue)) return;
+  // Fire-on-hold: trigger the F1/F4 long-press action the MOMENT the threshold passes while the
+  // key is still held down (not on release), and only once per hold.
+  if (s_f1_down_ms && !s_f1_fired && (millis() - s_f1_down_ms) >= 450) { s_f1_fired = true; openPowerMenu(); }
+  if (s_f4_down_ms && !s_f4_fired && (millis() - s_f4_down_ms) >= 450) { s_f4_fired = true; toggleControlCenter(); }
   bsp_input_event_t ev;
   int budget = 48;
   while (budget-- > 0 && xQueueReceive(s_nav_queue, &ev, 0) == pdTRUE) {
@@ -2028,48 +2099,62 @@ static void navPump() {
           default: break;
         }
       } else if (ev.type == INPUT_EVENT_TYPE_KEYBOARD) {
-        switch (ev.args_keyboard.ascii) {
-          case 'w': case 'W': case 'k': case 'K': navPushTap(LV_KEY_UP);    break;
-          case 's': case 'S': case 'j': case 'J': navPushTap(LV_KEY_DOWN);  break;
-          case '\r': case '\n': case ' ':         navPushTap(LV_KEY_ENTER); break;
-          case 8: case 127:                       navPushTap(LV_KEY_ESC);   break;
-          default: break;
-        }
+        const char dc = ev.args_keyboard.ascii;
+        const int  da = navDirForKey(dc);   // programmable: up/down move the highlight; select confirms; back cancels
+        if      (dc == '\r' || dc == '\n' || dc == ' ' || da == 4) navPushTap(LV_KEY_ENTER);
+        else if (dc == 8 || dc == 127 || da == 5)                  navPushTap(LV_KEY_ESC);
+        else if (da == 0)                                          navPushTap(LV_KEY_UP);
+        else if (da == 1)                                          navPushTap(LV_KEY_DOWN);
       }
       continue;
     }
-    lv_obj_t* ta = navFocusedTextarea();
+    lv_obj_t* ta_focused = navFocusedTextarea();                            // a text field is focused
+    lv_obj_t* ta = (ta_focused && s_nav_ta_editing) ? ta_focused : nullptr; // …and editing = the typing/caret target
     if (ev.type == INPUT_EVENT_TYPE_NAVIGATION) {
       const bool down = ev.args_navigation.state;
       const uint32_t mod = ev.args_navigation.modifiers;
       if (s_nav_debug && down) printf("[NAV] navkey=%d mod=%lu ta=%d\n", (int)ev.args_navigation.key, (unsigned long)mod, ta ? 1 : 0);
       switch (ev.args_navigation.key) {
-        case BSP_INPUT_NAVIGATION_KEY_UP:    navFifoPush(LV_KEY_PREV, down); break;
-        case BSP_INPUT_NAVIGATION_KEY_DOWN:  navFifoPush(LV_KEY_NEXT, down); break;
+        case BSP_INPUT_NAVIGATION_KEY_UP:    if (down) navMoveDir(NAV_UP);   break;   // 2D spatial: focus the element above
+        case BSP_INPUT_NAVIGATION_KEY_DOWN:  if (down) navMoveDir(NAV_DOWN); break;   // …below
         case BSP_INPUT_NAVIGATION_KEY_LEFT:
-          // Field: move caret. On the tab bar: previous screen. In content: focus the previous element.
+          // Field: move caret. Else: focus the element to the LEFT (2D spatial, not just prev-in-list).
           if (ta) { if (down) lv_textarea_cursor_left(ta); }
           else if (down && navOnTabBar()) navSwitchTab(-1);
-          else navFifoPush(LV_KEY_PREV, down);
+          else if (down) navMoveDir(NAV_LEFT);
           break;
         case BSP_INPUT_NAVIGATION_KEY_RIGHT:
-          // Field: move caret. On the tab bar: next screen. In content: focus the next element.
+          // Field: move caret. Else: focus the element to the RIGHT (2D spatial).
           if (ta) { if (down) lv_textarea_cursor_right(ta); }
           else if (down && navOnTabBar()) navSwitchTab(+1);
-          else navFifoPush(LV_KEY_NEXT, down);
+          else if (down) navMoveDir(NAV_RIGHT);
           break;
         case BSP_INPUT_NAVIGATION_KEY_TAB:   navFifoPush((mod & BSP_INPUT_MODIFIER_SHIFT) ? LV_KEY_PREV : LV_KEY_NEXT, down); break;
         case BSP_INPUT_NAVIGATION_KEY_RETURN:
         case BSP_INPUT_NAVIGATION_KEY_GAMEPAD_A:
         case BSP_INPUT_NAVIGATION_KEY_JOYSTICK_PRESS:
           if (navOnTabBar()) { if (down) navSwitchTab(+1); break; }   // Enter on the tab bar = next screen
+          if (ta_focused && !ta) { if (down) s_nav_ta_editing = true; break; }   // 1st Enter on a focused field = start typing
+          // Enter on an EMPTY composer drops back to navigate mode (cursor off); a non-empty composer falls through.
+          if (down && ta && (ta == g_lv.ch.composer_ta || ta == g_lv.dm.composer_ta) && !lv_textarea_get_text(ta)[0]) {
+            s_nav_ta_editing = false; break;
+          }
           if (s_nav_debug && down) printf("[NAV] ENTER focus=%p unread=%p first=%p last=%p tabbar=%p\n",
             (void*)lv_group_get_focused(s_nav_group), (void*)g_lv.home_unread, (void*)s_nav_first, (void*)s_nav_last, (void*)s_nav_tabbar);
           if (!ta && down) s_nav_entered_obj = lv_group_get_focused(s_nav_group);
           navFifoPush(ta ? LV_KEY_NEXT : LV_KEY_ENTER, down); break;   // on a field, Enter advances
-        case BSP_INPUT_NAVIGATION_KEY_F1:    // red ✕ — same as Esc (close the topmost modal/sheet/chat)
+        case BSP_INPUT_NAVIGATION_KEY_F1:    // red ✕ — tap = close topmost; HOLD = power menu (opens mid-hold, see navPump top)
+          if (down) { if (!s_f1_down_ms) { s_f1_down_ms = millis(); s_f1_fired = false; } break; }
+          { const bool fired = s_f1_fired; s_f1_down_ms = 0; s_f1_fired = false;
+            if (fired) break;                                                              // power menu already opened while held
+            if (s_nav_ta_editing) { s_nav_ta_editing = false; break; }                     // editing a field: ✕ stops typing first (cursor off → navigate)
+            LvChatPanel* cp = navOpenChatPanel(); if (cp) { closeChatPanel(cp); break; }   // tap: close chat…
+            if (anyPopupOpen()) { hwKeyDismissTopPopup(); break; }                         // …or the topmost modal…
+            navPushTap(LV_KEY_ESC); }                                                      // …or plain Esc
+          break;
         case BSP_INPUT_NAVIGATION_KEY_ESC:
         case BSP_INPUT_NAVIGATION_KEY_GAMEPAD_B:
+          if (down && s_nav_ta_editing) { s_nav_ta_editing = false; break; }                          // editing a field: Esc stops typing first (cursor off → navigate)
           if (down) { LvChatPanel* cp = navOpenChatPanel(); if (cp) { closeChatPanel(cp); break; } }  // close an open chat/channel first
           if (anyPopupOpen()) { if (down) hwKeyDismissTopPopup(); break; }   // else the topmost modal/sheet
           navFifoPush(LV_KEY_ESC, down);
@@ -2078,10 +2163,10 @@ static void navPump() {
         case BSP_INPUT_NAVIGATION_KEY_F2: if (down) navGoToMainTab(CHAT_INBOX_TAB_INDEX); break;  // orange △ = Messages
         case BSP_INPUT_NAVIGATION_KEY_F3: if (down) navGoToMainTab(CONTACTS_TAB_INDEX);   break;  // yellow □ = Contacts
         case BSP_INPUT_NAVIGATION_KEY_F4:                                                         // green ○ — tap=Home, hold=control center
-          if (down) { if (!s_f4_down_ms) s_f4_down_ms = millis(); }
-          else { if (s_f4_down_ms && (millis() - s_f4_down_ms) >= 450) toggleControlCenter();
-                 else homeKeyActivate();   // tap: Home, or (already on Home) toggle the app drawer — like the Home-tab button
-                 s_f4_down_ms = 0; }
+          if (down) { if (!s_f4_down_ms) { s_f4_down_ms = millis(); s_f4_fired = false; } }
+          else { const bool fired = s_f4_fired; s_f4_down_ms = 0; s_f4_fired = false;
+                 if (!fired) homeKeyActivate();   // tap: Home / toggle app drawer (control center already opened mid-hold if held)
+               }
           break;
         case BSP_INPUT_NAVIGATION_KEY_F5: if (down) navGoToMainTab(MAP_TAB_INDEX);        break;  // blue ♣ = Map
         case BSP_INPUT_NAVIGATION_KEY_F6: if (down) navGoToMainTab(SETTINGS_TAB_INDEX);   break;  // purple ◇ = Settings
@@ -2090,24 +2175,35 @@ static void navPump() {
     } else if (ev.type == INPUT_EVENT_TYPE_KEYBOARD) {
       char c = ev.args_keyboard.ascii;
       if (s_nav_debug) printf("[NAV] kbd ascii=%d '%c' ta=%d\n", (int)(uint8_t)c, (c >= 32 && c < 127) ? c : '?', ta ? 1 : 0);
+      if (s_navkey_capture >= 0) { navKeyCaptureApply((uint8_t)c); continue; }   // Settings remap: this key is the new binding
       if (ta) {                               // type straight into the focused field
         if (c == 8 || c == 127)          lv_textarea_del_char(ta);
-        else if (c == '\r' || c == '\n') navPushTap(LV_KEY_NEXT);   // Enter advances to next widget
-        else if ((uint8_t)c >= 32)       lv_textarea_add_char(ta, (uint32_t)(uint8_t)c);
-      } else {
-        switch (c) {                          // W/S(k/j)=prev/next; A/D(h/l)=prev/next (switch tabs on the bar)
-          case 'w': case 'W': case 'k': case 'K': navPushTap(LV_KEY_PREV); break;
-          case 's': case 'S': case 'j': case 'J': navPushTap(LV_KEY_NEXT); break;
-          case 'a': case 'A': case 'h': case 'H': if (navOnTabBar()) navSwitchTab(-1); else navPushTap(LV_KEY_PREV); break;
-          case 'd': case 'D': case 'l': case 'L': if (navOnTabBar()) navSwitchTab(+1); else navPushTap(LV_KEY_NEXT); break;
-          case '\r': case '\n': case ' ':
-            if (navOnTabBar()) { navSwitchTab(+1); break; }
-            s_nav_entered_obj = lv_group_get_focused(s_nav_group); navPushTap(LV_KEY_ENTER); break;
-          case 8: case 127:
-            if (anyPopupOpen()) { hwKeyDismissTopPopup(); break; }
-            navPushTap(LV_KEY_ESC); break;
-          default: break;
+        else if (c == '\r' || c == '\n') {
+          // Enter on an EMPTY composer drops back to navigate mode (cursor off) so the letter-nav
+          // keys work again; anywhere else it advances to the next widget.
+          if ((ta == g_lv.ch.composer_ta || ta == g_lv.dm.composer_ta) && !lv_textarea_get_text(ta)[0])
+            s_nav_ta_editing = false;
+          else navPushTap(LV_KEY_NEXT);
         }
+        else if ((uint8_t)c >= 32)       lv_textarea_add_char(ta, (uint32_t)(uint8_t)c);
+      } else if (c == '\r' || c == '\n' || c == ' ') {   // Enter / space = select — ALWAYS works (independent of the letter binds)
+        if (ta_focused) s_nav_ta_editing = true;         // on a focused field, select starts typing (letters navigate until then)
+        else if (navOnTabBar()) navSwitchTab(+1);
+        else { s_nav_entered_obj = lv_group_get_focused(s_nav_group); navPushTap(LV_KEY_ENTER); }
+      } else if (c == 8 || c == 127) {                    // Backspace = back — ALWAYS works
+        if (anyPopupOpen()) hwKeyDismissTopPopup(); else navPushTap(LV_KEY_ESC);
+      } else switch (navDirForKey(c)) {        // programmable letter nav — Tanmatsu defaults W up/A left/X down/D right/S select, F/V scroll
+        case 0: navMoveDir(NAV_UP);    break;                                               // up — 2D spatial
+        case 1: navMoveDir(NAV_DOWN);  break;                                               // down
+        case 2: if (navOnTabBar()) navSwitchTab(-1); else navMoveDir(NAV_LEFT);  break;     // left → element to the left
+        case 3: if (navOnTabBar()) navSwitchTab(+1); else navMoveDir(NAV_RIGHT); break;     // right → element to the right
+        case 4: if (navOnTabBar()) navSwitchTab(+1);                                        // select
+                else if (ta_focused) s_nav_ta_editing = true;                               // focused field: start typing
+                else { s_nav_entered_obj = lv_group_get_focused(s_nav_group); navPushTap(LV_KEY_ENTER); } break;
+        case 5: if (anyPopupOpen()) hwKeyDismissTopPopup(); else navPushTap(LV_KEY_ESC); break;  // back (unbound by default on Tanmatsu)
+        case 6: navScrollFocused(true);  break;                                             // scroll up
+        case 7: navScrollFocused(false); break;                                             // scroll down
+        default: break;                                                                     // not a nav key — ignore
       }
     }
   }
@@ -2183,7 +2279,10 @@ static bool navTopHasVisibleChild(lv_obj_t* top) {
   uint32_t n = lv_obj_get_child_cnt(top);
   for (uint32_t i = 0; i < n; i++) {
     lv_obj_t* c = lv_obj_get_child(top, i);
-    if (c && !lv_obj_has_flag(c, LV_OBJ_FLAG_HIDDEN)) return true;
+    // NAV_SKIP_FLAG overlays (e.g. the tap-to-pick accent box) are passive hints, not
+    // focus targets — they must NOT make nav re-root onto the top layer and steal focus
+    // off the field you're typing in.
+    if (c && !lv_obj_has_flag(c, LV_OBJ_FLAG_HIDDEN) && !lv_obj_has_flag(c, NAV_SKIP_FLAG)) return true;
   }
   return false;
 }
@@ -3479,6 +3578,7 @@ static void accentBoxMaybeShow() {
   s_accbox_ta = ta;
   const int cw = 34, ch = 40, gap = 4, pad = 6;
   s_accbox = lv_obj_create(lv_layer_top());
+  lv_obj_add_flag(s_accbox, NAV_SKIP_FLAG);   // passive tap-only hint: never a keyboard-nav focus target (issue #22)
   lv_obj_remove_style_all(s_accbox);
   lv_obj_set_style_bg_color(s_accbox, lv_color_hex(COLOR_PANEL), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(s_accbox, LV_OPA_COVER, LV_PART_MAIN);
@@ -3492,6 +3592,7 @@ static void accentBoxMaybeShow() {
   lv_obj_clear_flag(s_accbox, LV_OBJ_FLAG_SCROLLABLE);
   for (uint8_t i = 0; i < set->n; ++i) {
     lv_obj_t* c = lv_btn_create(s_accbox);
+    lv_obj_add_flag(c, NAV_SKIP_FLAG);   // tappable, but never a keyboard-nav focus stop
     lv_obj_set_size(c, cw, ch);
     lv_obj_set_style_radius(c, 5, LV_PART_MAIN);
     lv_obj_set_style_bg_color(c, lv_color_hex(0x1B2B3A), LV_PART_MAIN);
@@ -4016,6 +4117,28 @@ static const char* const k_emoji_items[] = {
 };
 static constexpr int k_emoji_count = (int)(sizeof(k_emoji_items) / sizeof(k_emoji_items[0]));
 
+// Special characters / symbols not easy to reach on a compact keyboard — their OWN picker,
+// separate from emoji. All render via the g_font_16 chain (montserrat ASCII base + extras_font
+// symbols/accents fallback), so no tofu.
+static const char* const k_special_items[] = {
+  // common ASCII symbols
+  "%","$","@","#","&","*","+","=","/","\\","|","<",">","~","^","`","[","]","{","}",
+  // currency / math / punctuation
+  "\xE2\x82\xAC","\xC2\xA3","\xC2\xA5","\xC2\xB0","\xC2\xB1","\xC3\x97","\xC3\xB7","\xC2\xBD","\xC2\xBC","\xC2\xBE",
+  "\xC2\xA7","\xC2\xA9","\xC2\xAE","\xE2\x84\xA2","\xE2\x80\xA2","\xE2\x80\x93","\xE2\x80\x94","\xE2\x80\xA6",
+  "\xE2\x86\x92","\xE2\x86\x90","\xE2\x86\x91","\xE2\x86\x93","\xE2\x89\xA0","\xE2\x89\xA4","\xE2\x89\xA5","\xE2\x84\x83","\xE2\x84\x89",
+  // accented letters
+  "\xC3\xA1","\xC3\xA9","\xC3\xAD","\xC3\xB3","\xC3\xBA","\xC3\xB1","\xC3\xBC","\xC3\xA7","\xC3\x9F",
+  "\xC3\xA0","\xC3\xA8","\xC3\xAC","\xC3\xB2","\xC3\xB9","\xC3\xA2","\xC3\xAA","\xC3\xAE","\xC3\xB4","\xC3\xBB",
+  "\xC3\xA4","\xC3\xAB","\xC3\xAF","\xC3\xB6","\xC3\xA3","\xC3\xB5","\xC3\xA5","\xC3\xB8","\xC3\xA6",
+};
+static constexpr int k_special_count = (int)(sizeof(k_special_items) / sizeof(k_special_items[0]));
+
+// The glyph picker (openEmojiPicker) renders whichever set these point at — emoji by default,
+// or the special-character set when opened from the text-edit menu's "Sym" button.
+static const char* const* s_glyph_items = k_emoji_items;
+static int                 s_glyph_count = k_emoji_count;
+
 static void closeEmojiSheet() {
   if (s_emoji_sheet) { lv_obj_del(s_emoji_sheet); s_emoji_sheet = nullptr; }
   s_emoji_target_ta = nullptr;
@@ -4032,8 +4155,8 @@ static void emojiSheetCloseCb(lv_event_t* e) {
 // (emojiPickCb) and the trackball selector (emojiSelectorClick).
 static void emojiInsertIndex(int idx) {
   lv_obj_t* ta = s_emoji_target_ta;
-  if (idx < 0 || idx >= k_emoji_count || !ta) { closeEmojiSheet(); return; }
-  const char* g = k_emoji_items[idx];
+  if (idx < 0 || idx >= s_glyph_count || !ta) { closeEmojiSheet(); return; }
+  const char* g = s_glyph_items[idx];
   // Insert into the keyboard MIRROR when it's bound to this field — otherwise a
   // later kbMirrorSyncToReal() would overwrite our insert with the stale mirror
   // contents (same trap the Wi-Fi scan picker hit). When not bound, insert
@@ -4076,7 +4199,7 @@ static constexpr int kEmojiSelStep = 3;   // raw counts per one-cell move (highe
 // Feed raw trackball motion; advances the highlighted cell at most one step per
 // axis per call. Called from the trackball poll while the emoji sheet is open.
 static void emojiSelectorMove(int rawdx, int rawdy) {
-  if (!s_emoji_grid || k_emoji_count == 0) return;
+  if (!s_emoji_grid || s_glyph_count == 0) return;
   if (s_emoji_sel < 0) {             // first motion just lands on cell 0
     s_emoji_sel = 0; s_emoji_acc_x = s_emoji_acc_y = 0;
     emojiPaintSelection();
@@ -4096,10 +4219,10 @@ static void emojiSelectorMove(int rawdx, int rawdy) {
   if (dc) idx += dc;                          // horizontal: free move across the flat list
   if (dr) {
     const int ni = idx + dr * cols;           // vertical: jump a full row
-    if (ni >= 0 && ni < k_emoji_count) idx = ni;
+    if (ni >= 0 && ni < s_glyph_count) idx = ni;
   }
   if (idx < 0) idx = 0;
-  if (idx >= k_emoji_count) idx = k_emoji_count - 1;
+  if (idx >= s_glyph_count) idx = s_glyph_count - 1;
   if (idx != s_emoji_sel) { s_emoji_sel = idx; emojiPaintSelection(); }
 }
 
@@ -4112,9 +4235,12 @@ static bool emojiSelectorClick() {
 }
 
 // Opened from the composer's emoji button. `ta` is the composer textarea.
-static void openEmojiPicker(lv_obj_t* ta) {
+static void openEmojiPicker(lv_obj_t* ta, const char* const* items = k_emoji_items,
+                            int count = k_emoji_count, const char* picker_title = "Insert emoji / symbol") {
   closeEmojiSheet();
   s_emoji_target_ta = ta;
+  s_glyph_items = items;
+  s_glyph_count = count;
   const lv_coord_t sw = lv_disp_get_hor_res(nullptr);
   const lv_coord_t sh = lv_disp_get_ver_res(nullptr);
   s_emoji_sheet = lv_obj_create(lv_layer_top());
@@ -4139,7 +4265,7 @@ static void openEmojiPicker(lv_obj_t* ta) {
   lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
 
   lv_obj_t* title = lv_label_create(card);
-  lv_label_set_text(title, TR("Insert emoji / symbol"));
+  lv_label_set_text(title, TR(picker_title));
   lv_obj_set_style_text_color(title, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
   lv_obj_set_style_text_font(title, &g_font_14, LV_PART_MAIN);
   lv_obj_set_pos(title, 2, 0);
@@ -4171,7 +4297,7 @@ static void openEmojiPicker(lv_obj_t* ta) {
   s_emoji_sel = -1;   // start un-highlighted; first roll selects index 0
   s_emoji_acc_x = s_emoji_acc_y = 0;
 
-  for (int i = 0; i < k_emoji_count; ++i) {
+  for (int i = 0; i < s_glyph_count; ++i) {
     lv_obj_t* b = lv_btn_create(grid);
     lv_obj_set_size(b, 38, 38);
     styleButton(b);
@@ -4179,11 +4305,17 @@ static void openEmojiPicker(lv_obj_t* ta) {
     lv_obj_set_style_pad_all(b, 0, LV_PART_MAIN);
     lv_obj_add_event_cb(b, emojiPickCb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
     lv_obj_t* l = lv_label_create(b);
-    lv_label_set_text(l, k_emoji_items[i]);
+    lv_label_set_text(l, s_glyph_items[i]);
     lv_obj_set_style_text_font(l, &g_font_16, LV_PART_MAIN);
     lv_obj_set_style_text_color(l, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
     lv_obj_center(l);
   }
+}
+
+// Special-character picker: the same sheet/grid as the emoji picker, but the dedicated
+// symbol set + its own title. Opened from the text-edit menu's "Sym" button.
+static void openSpecialPicker(lv_obj_t* ta) {
+  openEmojiPicker(ta, k_special_items, k_special_count, "Special characters");
 }
 
 static void openEmojiPickerCb(lv_event_t* e) {
@@ -4732,13 +4864,14 @@ static void txtMenuHide() {
   s_txtmenu_ta = nullptr;
 }
 
-enum { TXT_CUT = 0, TXT_COPY, TXT_PASTE, TXT_SELALL };
+enum { TXT_CUT = 0, TXT_COPY, TXT_PASTE, TXT_SELALL, TXT_SYM };
 
 static void txtMenuCellCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
   intptr_t act = reinterpret_cast<intptr_t>(lv_event_get_user_data(e));
   lv_obj_t* ta = s_txtmenu_ta;
   if (!ta) { txtMenuHide(); return; }
+  if (act == TXT_SYM) { txtMenuHide(); openSpecialPicker(ta); return; }   // dedicated special-character picker
   const char* txt = lv_textarea_get_text(ta);
   uint32_t s_cp = 0, e_cp = 0;
   bool sel = taHasSelection(ta, &s_cp, &e_cp);
@@ -4777,8 +4910,8 @@ static void txtMenuShow(lv_obj_t* ta) {
   txtMenuHide();
   if (!ta) return;
   s_txtmenu_ta = ta;
-  static const char* const kLabels[] = { "Cut", "Copy", "Paste", "All" };
-  const int n = 4, cw = 52, ch = 34, gap = 4, pad = 6;
+  static const char* const kLabels[] = { "Cut", "Copy", "Paste", "All", "Sym" };
+  const int n = 5, cw = 48, ch = 34, gap = 4, pad = 6;
   s_txtmenu = lv_obj_create(lv_layer_top());
   lv_obj_remove_style_all(s_txtmenu);
   lv_obj_set_style_bg_color(s_txtmenu, lv_color_hex(COLOR_PANEL), LV_PART_MAIN);
@@ -5000,7 +5133,12 @@ static lv_obj_t* createSettingsModal(const char* title, SettingsModalKind kind) 
   styleButton(close_btn);
   lv_obj_add_event_cb(close_btn, settingsCloseCb, LV_EVENT_CLICKED, nullptr);
   lv_obj_t* close_lbl = lv_label_create(close_btn);
+#if defined(HAS_TANMATSU)
+  { char _cb[40]; snprintf(_cb, sizeof _cb, LV_SYMBOL_CLOSE "  %s", TR("Close")); lv_label_set_text(close_lbl, _cb);
+    lv_obj_set_style_text_color(close_lbl, lv_color_hex(0xE05544), LV_PART_MAIN); }   // red ✕
+#else
   lv_label_set_text(close_lbl, TR("Close"));
+#endif
   lv_obj_center(close_lbl);
 
   lv_obj_t* body = lv_obj_create(root);
@@ -6675,6 +6813,18 @@ static void kbdNavToggleCb(lv_event_t* e) {
   navMenubarKeysSync();   // show/hide the per-tab key hints in the menubar
   if (g_lv.task) g_lv.task->showAlert(on ? TR("Keyboard nav: WASDZ on") : TR("Keyboard nav: off"), 1100);
 }
+
+// "Show menu-bar letters": reveal/hide the per-tab hotkey letters over the menubar icons.
+// Default off (the letters never show unless the user turns this on).
+static void navMbarKeysToggleCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  const bool on = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+#if defined(ESP32)
+  touchPrefsSetNavMenubarKeys(on);
+#endif
+  s_nav_mbar_keys = on;
+  navMenubarKeysSync();   // apply immediately
+}
 #endif
 
 // Hide the device/profile name in the status bar and park the clock on the left
@@ -6854,7 +7004,7 @@ static void openTimezonePicker() {
   lv_obj_align(close, LV_ALIGN_TOP_RIGHT, -6, 4);
   styleButton(close);
   lv_obj_add_event_cb(close, tzPickerCloseCb, LV_EVENT_CLICKED, nullptr);
-  lv_obj_t* cl = lv_label_create(close); lv_label_set_text(cl, LV_SYMBOL_CLOSE);
+  lv_obj_t* cl = lv_label_create(close); lv_label_set_text(cl, LV_SYMBOL_CLOSE); tanCloseRed(cl);
   lv_obj_set_style_text_font(cl, &g_font_12, LV_PART_MAIN); lv_obj_center(cl);
 
   lv_obj_t* list = lv_obj_create(s_tz_picker);
@@ -7277,6 +7427,40 @@ static void buildDeviceSettings(int sec) {
   }
 #endif
 
+#if defined(HAS_TANMATSU)
+  /* Tanmatsu keyboard navigation: the arrow keys + Enter ALWAYS navigate; these letter
+     keys are programmable extras. The menu/tab keys use the coloured F-keys and aren't
+     remappable here. Applied live. */
+  {
+    y += settingsRowLabel(body, y, 4, "Navigation keys", COLOR_TEXT, &g_font_12, 0) + 2;
+    y += settingsRowLabel(body, y, 0, "Arrows + Enter always work. These letters are extra \xe2\x80\x94 tap a row, then press a key.",
+                          COLOR_SUB, &g_font_12, 0) + 2;
+    static const int kTanNavRows[7] = { 0, 2, 4, 1, 3, 6, 7 };  // Up, Left, Select, Down, Right, Scroll up, Scroll down (Back omitted)
+    for (int r = 0; r < 7; r++) {
+      const int d = kTanNavRows[r], bi = d + 5;   // binding index 5-12
+      lv_obj_t* row = lv_btn_create(body);
+      lv_obj_set_size(row, lv_pct(100), SC(30));
+      lv_obj_set_pos(row, 2, y);
+      styleButton(row);
+      lv_obj_add_event_cb(row, navKeyCaptureStartCb, LV_EVENT_CLICKED, (void*)(intptr_t)bi);
+      lv_obj_t* nm = lv_label_create(row);
+      lv_label_set_text(nm, TR(kNavDirNames[d]));
+      lv_obj_set_style_text_font(nm, &g_font_12, LV_PART_MAIN);
+      lv_obj_set_style_text_color(nm, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+      lv_obj_align(nm, LV_ALIGN_LEFT_MID, 8, 0);
+      lv_obj_t* kv = lv_label_create(row);
+      const int lk = navKeyLower(s_dir_keys[d]);
+      char kb[2] = { (char)(lk >= 'a' && lk <= 'z' ? lk - 'a' + 'A' : (lk ? lk : '-')), 0 };
+      lv_label_set_text(kv, kb);
+      lv_obj_set_style_text_font(kv, &g_font_14, LV_PART_MAIN);
+      lv_obj_set_style_text_color(kv, lv_color_hex(COLOR_ACCENT), LV_PART_MAIN);
+      lv_obj_align(kv, LV_ALIGN_RIGHT_MID, -10, 0);
+      s_navkey_row_val[bi] = kv;
+      y += SC(36);
+    }
+  }
+#endif
+
 #if defined(HAS_TDECK_TRACKBALL)
 #if defined(HAS_TDECK_KEYBOARD)
   /* Keyboard navigation: off (default) vs on. When no text field is focused, the
@@ -7296,6 +7480,18 @@ static void buildDeviceSettings(int sec) {
                           COLOR_SUB, &g_font_12, 0) + 2;
     y += settingsRowLabel(body, y, 0, "drive the UI without the screen; keys still type in text fields",
                           COLOR_SUB, &g_font_12, 0) + 2;
+    // Show the per-tab hotkey letters over the menubar icons. Off by default — the letters
+    // only appear when this is turned on.
+    {
+      int h2 = settingsRowLabel(body, y, 4, "Show menu-bar letters", COLOR_TEXT, &g_font_12, 56);
+      lv_obj_t* sw2 = lv_switch_create(body);
+      lv_obj_align(sw2, LV_ALIGN_TOP_RIGHT, 0, y);
+#if defined(ESP32)
+      if (touchPrefsGetNavMenubarKeys()) lv_obj_add_state(sw2, LV_STATE_CHECKED);
+#endif
+      lv_obj_add_event_cb(sw2, navMbarKeysToggleCb, LV_EVENT_VALUE_CHANGED, nullptr);
+      y += LV_MAX(34, h2 + 10);
+    }
     // Programmable tab hotkeys — tap a row, then press a key to reassign it.
     y += settingsRowLabel(body, y, 0, "Tab hotkeys \xe2\x80\x94 tap a row, then press a key", COLOR_SUB, &g_font_12, 0) + 2;
     for (int t = 0; t < 5; t++) {
@@ -8197,7 +8393,13 @@ static void openWifiScanPopup() {
   lv_obj_align(close, LV_ALIGN_TOP_RIGHT, -6, 4);
   styleButton(close);
   lv_obj_add_event_cb(close, wifiScanPopupCloseCb, LV_EVENT_CLICKED, nullptr);
-  { lv_obj_t* cl = lv_label_create(close); lv_label_set_text(cl, TR("Close"));
+  { lv_obj_t* cl = lv_label_create(close);
+#if defined(HAS_TANMATSU)
+    char _cb[40]; snprintf(_cb, sizeof _cb, LV_SYMBOL_CLOSE "  %s", TR("Close")); lv_label_set_text(cl, _cb);
+    lv_obj_set_style_text_color(cl, lv_color_hex(0xE05544), LV_PART_MAIN);   // red ✕
+#else
+    lv_label_set_text(cl, TR("Close"));
+#endif
     lv_obj_set_style_text_font(cl, &g_font_12, LV_PART_MAIN); lv_obj_center(cl); }
 
   s_wifi_scan_list = lv_obj_create(s_wifi_scan_popup);
@@ -11004,6 +11206,7 @@ static void shareMyContactBtnCb(lv_event_t* e) {
 static lv_obj_t* s_home_batt_icon = nullptr;
 static lv_obj_t* s_home_batt_pct  = nullptr;
 static lv_obj_t* s_home_clock     = nullptr;
+static void fmtClockHM(char* buf, size_t cap, const struct tm* t);  // 12/24h-aware HH:MM (defined below)
 // Small pulsing dot next to the title — animates while the LVGL timer is alive.
 static lv_obj_t* s_home_heartbeat = nullptr;
 // TX / RX activity chart on Home. Two series: TX (sent, green) and RX (recv,
@@ -11603,21 +11806,21 @@ static void refreshHomeBattery() {
       s_last_chg = charging;
     }
   }
-  // Live HH:MM clock from the RTC (which gets NTP-synced over Wi-Fi). Only
-  // touch lv_label_set_text when the rendered minute actually changes.
+  // Live clock from the RTC (NTP / mesh-synced). Honors the 12/24-hour pref via
+  // fmtClockHM. Dedup on the rendered STRING (not the minute) so flipping the
+  // 12-hour toggle re-renders on the next tick, and only touch the label on change.
   if (s_home_clock) {
-    static int s_last_min = -1;
+    static char s_last_clock[12] = {0};
 #if defined(ESP32)
     time_t now_t = time(nullptr);
     if (now_t > 1700000000) {  // ~ "RTC has been bootstrapped" sentinel
       struct tm tm_loc;
       localtime_r(&now_t, &tm_loc);
-      const int min_of_day = tm_loc.tm_hour * 60 + tm_loc.tm_min;
-      if (min_of_day != s_last_min) {
-        char buf[8];
-        snprintf(buf, sizeof(buf), "%02d:%02d", tm_loc.tm_hour, tm_loc.tm_min);
+      char buf[12];
+      fmtClockHM(buf, sizeof(buf), &tm_loc);
+      if (strcmp(buf, s_last_clock) != 0) {
         lv_label_set_text(s_home_clock, buf);
-        s_last_min = min_of_day;
+        strncpy(s_last_clock, buf, sizeof(s_last_clock) - 1);
       }
     }
 #endif
@@ -11903,7 +12106,12 @@ static lv_obj_t* openFullscreenView(const char* title) {
   styleButton(home);
   lv_obj_add_event_cb(home, fullscreenHomeCb, LV_EVENT_CLICKED, nullptr);
   lv_obj_t* hl = lv_label_create(home);
+#if defined(HAS_TANMATSU)
+  lv_label_set_text(hl, LV_SYMBOL_CLOSE);   // red ✕ close
+  lv_obj_set_style_text_color(hl, lv_color_hex(0xE05544), LV_PART_MAIN);
+#else
   lv_label_set_text(hl, LV_SYMBOL_HOME);
+#endif
   lv_obj_center(hl);
   lv_obj_move_foreground(home);
   return body;
@@ -13073,7 +13281,7 @@ static void fmOpenEditor(const char* name) {
   styleButton(cancel);
   lv_obj_set_style_bg_color(cancel, lv_color_hex(0x3A4A5C), LV_PART_MAIN);
   lv_obj_add_event_cb(cancel, fmEditorCancelCb, LV_EVENT_CLICKED, nullptr);
-  lv_obj_t* cl = lv_label_create(cancel); lv_label_set_text(cl, LV_SYMBOL_CLOSE);
+  lv_obj_t* cl = lv_label_create(cancel); lv_label_set_text(cl, LV_SYMBOL_CLOSE); tanCloseRed(cl);
   lv_obj_set_style_text_font(cl, &g_font_12, LV_PART_MAIN); lv_obj_center(cl);
 
   s_editor_ta = lv_textarea_create(s_editor_root);
@@ -13362,7 +13570,7 @@ static void fmOpenImage(const char* name) {
   styleButton(close);
   lv_obj_set_style_bg_color(close, lv_color_hex(0x3A4A5C), LV_PART_MAIN);
   lv_obj_add_event_cb(close, fmImageCloseCb, LV_EVENT_CLICKED, nullptr);
-  lv_obj_t* cl = lv_label_create(close); lv_label_set_text(cl, LV_SYMBOL_CLOSE);
+  lv_obj_t* cl = lv_label_create(close); lv_label_set_text(cl, LV_SYMBOL_CLOSE); tanCloseRed(cl);
   lv_obj_set_style_text_font(cl, &g_font_12, LV_PART_MAIN); lv_obj_center(cl);
 
   // Full-screen toggle, just left of the close (X).
@@ -18974,7 +19182,12 @@ static void makeChatDetail(LvChatPanel& p) {
   lv_obj_add_event_cb(home, backBtnCb, LV_EVENT_PRESSED, &p);
   lv_obj_add_event_cb(home, backBtnCb, LV_EVENT_CLICKED, &p);
   lv_obj_t* hl = lv_label_create(home);
+#if defined(HAS_TANMATSU)
+  lv_label_set_text(hl, LV_SYMBOL_CLOSE);   // red ✕ close (Esc/F1 already closes the chat)
+  lv_obj_set_style_text_color(hl, lv_color_hex(0xE05544), LV_PART_MAIN);
+#else
   lv_label_set_text(hl, LV_SYMBOL_HOME);
+#endif
   lv_obj_center(hl);
 }
 
@@ -19092,7 +19305,49 @@ static void buildLanguageSettings() {
 // firmware.elf — see the tdeck-coredump-decode notes.
 static size_t s_crash_dump_size = 0;     // bytes of a pending dump; 0 = none
 
+// ---- Task-WDT self-record: name the culprit task in the crash report --------
+// A coredump can't tell us WHICH task starved the watchdog — that only prints to
+// the serial console (field users don't have it), and a panic-while-dumping can
+// truncate the ELF (the 'elf_save_task' store-to-0x0 we saw). So at the instant the
+// Task-WDT trips, record the task running on BOTH cores into a .noinit buffer that
+// survives the panic reboot; the export then writes it as a sidecar .txt. For the
+// SPIFFS-GC stall this chases that's CPU0=ipc0 (stalled idle/IPC core) + CPU1=<the
+// flash writer> — which finally names the unguarded heavy write.
+#if !defined(HAS_TANMATSU)
+struct CrashWdtCapture { uint32_t magic; char cpu0[16]; char cpu1[16]; uint32_t tick; };
+static const uint32_t kCrashWdtMagic = 0x57445431;   // 'WDT1'
+__NOINIT_ATTR static CrashWdtCapture s_crash_wdt;     // .noinit: not zeroed at startup, survives a panic reboot
+
+// IDF weak hook, invoked from task_wdt_isr the moment the watchdog trips, BEFORE the
+// panic abort. ISR context — TCB pointer reads only, no malloc / no blocking.
+extern "C" void esp_task_wdt_isr_user_handler(void) {
+  TaskHandle_t t0 = xTaskGetCurrentTaskHandleForCPU(0);
+  TaskHandle_t t1 = xTaskGetCurrentTaskHandleForCPU(1);
+  const char* n0 = t0 ? pcTaskGetName(t0) : "?";
+  const char* n1 = t1 ? pcTaskGetName(t1) : "?";
+  strlcpy(s_crash_wdt.cpu0, n0 ? n0 : "?", sizeof s_crash_wdt.cpu0);
+  strlcpy(s_crash_wdt.cpu1, n1 ? n1 : "?", sizeof s_crash_wdt.cpu1);
+  s_crash_wdt.tick  = xTaskGetTickCountFromISR();
+  s_crash_wdt.magic = kCrashWdtMagic;
+}
+
+static char s_crash_wdt_str[96] = {0};   // human-readable, empty unless a capture survived
+static void crashWdtCaptureRead() {
+  if (s_crash_wdt.magic != kCrashWdtMagic) return;
+  s_crash_wdt.magic = 0;                 // consume: don't re-report on the next clean boot
+  s_crash_wdt.cpu0[sizeof s_crash_wdt.cpu0 - 1] = '\0';
+  s_crash_wdt.cpu1[sizeof s_crash_wdt.cpu1 - 1] = '\0';
+  snprintf(s_crash_wdt_str, sizeof s_crash_wdt_str,
+           "Task watchdog: CPU0=%s  CPU1=%s", s_crash_wdt.cpu0, s_crash_wdt.cpu1);
+  Serial.printf("[CRASH] %s\n", s_crash_wdt_str);
+}
+#else
+static char s_crash_wdt_str[1] = {0};
+static inline void crashWdtCaptureRead() {}
+#endif
+
 static void crashDumpCheck() {
+  crashWdtCaptureRead();   // pull the Task-WDT culprit (if any) before checking for a dump
   size_t addr = 0, size = 0;
   if (esp_core_dump_image_check() == ESP_OK &&
       esp_core_dump_image_get(&addr, &size) == ESP_OK && size > 0 && size < (1u << 20)) {
@@ -19134,6 +19389,21 @@ static bool crashDumpExport(char* out_path, size_t out_cap) {
   heap_caps_free(buf);
   f.close();
   if (!ok) { dst->remove(path); return false; }
+  // Sidecar text: makes the report self-describing even when the ELF is truncated
+  // (panic-while-dumping) — names the Task-WDT culprit, reset reason, and build.
+  {
+    char tpath[96]; snprintf(tpath, sizeof tpath, "%s.txt", path);
+    File tf = dst->open(tpath, "w");
+    if (tf) {
+      tf.printf("wadamesh crash report\n");
+#ifdef FIRMWARE_RELEASE_TAG
+      tf.printf("firmware: %s\n", FIRMWARE_RELEASE_TAG);
+#endif
+      tf.printf("reset: %s\n", resetReasonString(esp_reset_reason()));
+      if (s_crash_wdt_str[0]) tf.printf("%s\n", s_crash_wdt_str);
+      tf.close();
+    }
+  }
   esp_core_dump_image_erase();   // the file is the durable copy now; clears the boot warning
   s_crash_dump_size = 0;
   snprintf(out_path, out_cap, "%s%s", used_sd ? "SD " : "Internal ", path);
@@ -19170,9 +19440,12 @@ static void crashReportConfirmCb() {
 }
 static void crashReportMaybePrompt() {
   if (s_crash_dump_size == 0) return;
-  showConfirm(LV_SYMBOL_WARNING "  The device restarted after a crash.\n\n"
-              "Sending the crash report helps us find and fix the bug. Save it now?",
-              "Save report", crashReportConfirmCb);
+  static char m[280];
+  snprintf(m, sizeof m,
+           LV_SYMBOL_WARNING "  The device restarted after a crash.\n\n%s%s"
+           "Sending the crash report helps us find and fix the bug. Save it now?",
+           s_crash_wdt_str[0] ? s_crash_wdt_str : "", s_crash_wdt_str[0] ? "\n\n" : "");
+  showConfirm(m, "Save report", crashReportConfirmCb);
 }
 #endif  // ESP32
 
@@ -19476,7 +19749,7 @@ static void formatBubbleHhMm(uint32_t ts, char* out, int cap) {
   time_t t = (time_t)ts;
   struct tm tm_loc{};
   localtime_r(&t, &tm_loc);
-  snprintf(out, cap, "%02d:%02d", tm_loc.tm_hour, tm_loc.tm_min);
+  fmtClockHM(out, (size_t)cap, &tm_loc);   // honor the 12/24-hour pref
 }
 
 static void formatFullTimestamp(uint32_t ts, char* out, int cap) {
@@ -19672,6 +19945,20 @@ static void msgMenuBlockCb(lv_event_t* e) {
   g_lv.task->showAlert(ok ? TR("Sender blocked") : TR("Block list full"), 1500);
 }
 
+// "Resend" (outgoing messages only): transmit the same text again to the open
+// thread — for when a DM never got its ✓✓ ack, or a channel post may not have
+// propagated. Sends the snapshotted body (s_msg_menu_text) via the normal composer
+// send path, which adds a fresh outgoing bubble; the composer draft is left intact.
+static void msgMenuResendCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED || !g_lv.task) return;
+  lv_indev_t* a = lv_indev_get_act();
+  if (a) lv_indev_wait_release(a);
+  closeMsgActionMenu();
+  if (!s_msg_menu_text[0]) return;
+  if (!g_lv.task->composerSend(s_msg_menu_text))
+    g_lv.task->showAlert(TR("Resend failed"), 1400);
+}
+
 // Compose a one-tap "ack" for an incoming message: @mentions the sender (on a
 // channel) and reports the link quality + route of THAT message, so you can
 // confirm to them their (test) message arrived and how strong it came in. Built
@@ -19743,6 +20030,7 @@ static void openMessageActionMenu(int msg_idx) {
   const bool can_ack     = !m.outgoing && m.sender[0];   // ack its sender (channel or DM)
   const bool can_mention = m.channel && !m.outgoing && m.sender[0];
   const bool can_block   = !m.outgoing;   // block the sender — never for our own messages
+  const bool can_resend  = m.outgoing && m.text[0];   // re-send one of OUR messages (DM or channel)
 
   lv_coord_t sw = lv_disp_get_hor_res(nullptr);
   lv_coord_t sh = lv_disp_get_ver_res(nullptr);
@@ -19763,7 +20051,7 @@ static void openMessageActionMenu(int msg_idx) {
   const int pad    = 10;
   // Header row reserves space for the close-X badge so it doesn't sit on a button.
   const int hdr_h  = 24;
-  const int nbtn   = (can_ack ? 1 : 0) + (can_mention ? 1 : 0) + 2 /*Copy+Info*/ + (can_block ? 1 : 0);
+  const int nbtn   = (can_ack ? 1 : 0) + (can_mention ? 1 : 0) + 2 /*Copy+Info*/ + (can_block ? 1 : 0) + (can_resend ? 1 : 0);
   int card_h = hdr_h + nbtn * btn_h + (nbtn - 1) * gap + 2 * pad;
   // Never exceed the visible area under the status bar; scroll if it ever would
   // (e.g. an even taller menu, or a shorter display). The close-X floats, so it
@@ -19815,7 +20103,8 @@ static void openMessageActionMenu(int msg_idx) {
   }
   mk_btn(LV_SYMBOL_COPY "  Copy", msgMenuCopyCb, by);  by += btn_h + gap;
   mk_btn(LV_SYMBOL_LIST "  Info", msgMenuInfoCb, by);
-  if (can_block) { by += btn_h + gap; mk_btn(LV_SYMBOL_CLOSE "  Block", msgMenuBlockCb, by); }
+  if (can_block)  { by += btn_h + gap; mk_btn(LV_SYMBOL_CLOSE   "  Block",  msgMenuBlockCb,  by); }
+  if (can_resend) { by += btn_h + gap; mk_btn(LV_SYMBOL_REFRESH "  Resend", msgMenuResendCb, by); }
 }
 
 // "Trace route" from the message Info popup: run a full multi-hop trace to the
@@ -20362,7 +20651,7 @@ static void refreshChatDetail(LvChatPanel& p) {
     // Footer row: HH:MM timestamp + (for outgoing DMs) the delivery glyph.
     // Both sit in one label so they share the bottom-right anchor — keeps
     // the bubble content-driven without an extra flex container.
-    char ts_buf[8];
+    char ts_buf[12];   // room for "12:05 PM"
     formatBubbleHhMm(m.ts, ts_buf, sizeof(ts_buf));
     const char* deliv_glyph = "";
     uint32_t deliv_fg = COLOR_SUB;
@@ -21285,7 +21574,7 @@ static bool anyPopupOpen() {
          s_meminfo_root || settingsModalIsOpen() || s_settings_sheet || s_cc_root ||
          s_appdrawer_root || s_power_menu || s_siginfo_root || s_monitor_root || s_mentions_root || s_ct_sort_sheet || s_ctd_overlay
          || anyLateModalOpen()      // discovered/map-opts/emoji/accent/tz/chanscope/blocked/backup/batt/wifi-scan/(TDeck: lockwall, telemetry)
-#if defined(HAS_TDECK_GT911)
+#if defined(HAS_TDECK_GT911) || defined(HAS_TANMATSU)
          || s_fullscreen_view || s_term_picker_root || s_fm_prompt || s_fm_actions || s_editor_root || s_fm_img_root
 #endif
          ;
@@ -21300,7 +21589,7 @@ static bool hwKeyDismissTopPopup() {
   if (s_meminfo_root)     { closeMemInfo();            return true; }   // topmost diagnostic popup
   if (s_monitor_root)     { closeMonitorPage();        return true; }   // RF monitor app page
   if (s_siginfo_root)     { closeSigInfoPopup();       return true; }   // home "Signal & traffic" popup
-#if defined(HAS_TDECK_GT911)
+#if defined(HAS_TDECK_GT911) || defined(HAS_TANMATSU)
   if (s_fm_img_root)      { fmImageClose();           return true; }   // image viewer (top FM overlay)
   if (s_editor_root)      { fmEditorClose();          return true; }   // file-manager modals first
   if (s_fm_prompt)        { fmPromptClose();          return true; }
@@ -21434,9 +21723,9 @@ static void lockscreenUpdateClock() {
   if (!s_lock_clock) return;
   mesh::RTCClock* rtc = the_mesh.getRTCClock();
   uint32_t t = rtc ? rtc->getCurrentTime() : 0;
-  int hh = 0, mm = 0;
-  if (t > 0) { time_t tt = (time_t)t; struct tm v; localtime_r(&tt, &v); hh = v.tm_hour; mm = v.tm_min; }
-  char b[8]; snprintf(b, sizeof b, "%02d:%02d", hh, mm);
+  int mm = 0;
+  char b[12]; snprintf(b, sizeof b, "00:00");
+  if (t > 0) { time_t tt = (time_t)t; struct tm v; localtime_r(&tt, &v); fmtClockHM(b, sizeof b, &v); mm = v.tm_min; }
   lv_label_set_text(s_lock_clock, b);
   s_lock_clock_min = mm;
 }
@@ -21701,7 +21990,7 @@ static void openLockWallPicker() {
   lv_obj_align(close, LV_ALIGN_TOP_RIGHT, -6, 4);
   styleButton(close);
   lv_obj_add_event_cb(close, lockwallPickerCloseCb, LV_EVENT_CLICKED, nullptr);
-  lv_obj_t* cl = lv_label_create(close); lv_label_set_text(cl, LV_SYMBOL_CLOSE);
+  lv_obj_t* cl = lv_label_create(close); lv_label_set_text(cl, LV_SYMBOL_CLOSE); tanCloseRed(cl);
   lv_obj_set_style_text_font(cl, &g_font_12, LV_PART_MAIN); lv_obj_center(cl);
 
   lv_obj_t* list = lv_obj_create(s_lockwall_picker);
@@ -21946,7 +22235,7 @@ static void openBackupPicker() {
   lv_obj_align(close, LV_ALIGN_TOP_RIGHT, -6, 4);
   styleButton(close);
   lv_obj_add_event_cb(close, backupPickerCloseCb, LV_EVENT_CLICKED, nullptr);
-  lv_obj_t* cl = lv_label_create(close); lv_label_set_text(cl, LV_SYMBOL_CLOSE);
+  lv_obj_t* cl = lv_label_create(close); lv_label_set_text(cl, LV_SYMBOL_CLOSE); tanCloseRed(cl);
   lv_obj_set_style_text_font(cl, &g_font_12, LV_PART_MAIN); lv_obj_center(cl);
 
   lv_obj_t* list = lv_obj_create(s_backup_picker);
@@ -22322,8 +22611,24 @@ static void handleHwKey(int key) {
 #endif
   // The on-screen keyboard is never shown on the T-Deck, but a textarea is still
   // bound to it on focus — that binding is our target.
-  lv_obj_t* ta = lv_keyboard_get_textarea(g_lv.keyboard);
+  lv_obj_t* ta_focused = lv_keyboard_get_textarea(g_lv.keyboard);
+#if defined(HAS_TDECK_TRACKBALL)
+  // Edit mode: a focused field only becomes the typing target after select/Enter (below);
+  // until then `ta` is null so the letter-nav keys navigate instead of typing into it.
+  lv_obj_t* ta = (ta_focused && s_nav_ta_editing) ? ta_focused : nullptr;
+#else
+  lv_obj_t* ta = ta_focused;
+#endif
   if (!ta) {
+#if defined(HAS_TDECK_TRACKBALL)
+    // A field is focused but we're in navigate mode: select/Enter starts editing it, so the
+    // letter-nav keys keep navigating until you explicitly enter the field (matches navPump).
+    if (ta_focused && s_kbd_nav && (key == '\r' || key == '\n' || navDirForKey(key) == 4)) {
+      s_nav_ta_editing = true;
+      if (g_lv.task) g_lv.task->noteUserInput();
+      return;
+    }
+#endif
     // First-boot setup owns the screen: with no field focused, swallow the key
     // so it can't switch the (hidden) tabs behind the wizard or arm the lock.
     if (s_setup_root) return;
@@ -22366,9 +22671,14 @@ static void handleHwKey(int key) {
       }
       // Programmable tab hotkeys (default E/R/T/U/I) — jump straight to a main tab.
       // The Home hotkey mirrors tapping the Home tab: on Home it toggles Commander
-      // <-> app drawer, otherwise it goes Home.
+      // <-> app drawer, otherwise it goes Home. BUT NOT while a text field is the
+      // focused element — a hotkey letter must never yank you off a field you're
+      // working in (e.g. the chat composer in navigate mode); the directional nav
+      // above still moves focus. Other letters are swallowed here so they can't reach
+      // the tabForKey fallback below and tab-jump either.
+      const bool on_textfield = navFocusedTextarea() != nullptr;
       const int njump = navTabForHotkey(key);
-      if (njump >= 0) {
+      if (njump >= 0 && !on_textfield) {
         // Home hotkey mirrors tapping the Home tab: on Home toggle Commander <-> app
         // drawer, else go Home. (homeKeyActivate is HAS_TANMATSU-only, so inline it.)
         if (njump == HOME_TAB_INDEX && getActiveTab() == HOME_TAB_INDEX) setHomeDrawer(!s_home_drawer_mode);
@@ -22376,6 +22686,7 @@ static void handleHwKey(int key) {
         if (g_lv.task) g_lv.task->noteUserInput();
         return;
       }
+      if (on_textfield) { if (g_lv.task) g_lv.task->noteUserInput(); return; }   // field focused: never tab-jump on a letter
     }
 #endif
     // Not editing a field. If a popup is up, the dismiss keys close it; on a
@@ -22457,6 +22768,9 @@ static void handleHwKey(int key) {
           }
           lv_keyboard_set_textarea(g_lv.keyboard, p->composer_ta);  // re-bind
         }
+#if defined(HAS_TDECK_TRACKBALL)
+        else if (s_kbd_nav) s_nav_ta_editing = false;   // Enter on an EMPTY composer: drop to navigate mode (cursor off)
+#endif
       }
     } else {
       hideKb();   // settings/other field: confirm (syncs into the real field) + unfocus
@@ -23001,10 +23315,16 @@ static void openPowerMenu() {
   lv_obj_clear_flag(s_power_menu, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_event_cb(s_power_menu, powerMenuBackdropCb, LV_EVENT_CLICKED, nullptr);
 
+#if defined(HAS_TANMATSU)
+  const int card_w = (sw - 80 > 420) ? 420 : (sw - 80);
+  const int p_bh = 52, p_y0 = 46, p_step = 60, card_h = p_y0 + 4 * p_step + 8;   // bigger on the 800×480 panel
+#else
   const int card_w = (sw - 40 > 240) ? 240 : (sw - 40);
+  const int p_bh = 34, p_y0 = 28, p_step = 40, card_h = 206;
+#endif
   lv_obj_t* card = lv_obj_create(s_power_menu);
   lv_obj_remove_style_all(card);
-  lv_obj_set_size(card, card_w, 206);
+  lv_obj_set_size(card, card_w, card_h);
   lv_obj_align(card, LV_ALIGN_CENTER, 0, 0);
   styleSurface(card, COLOR_PANEL, 10);
   lv_obj_set_style_border_color(card, lv_color_hex(0x18191A), LV_PART_MAIN);
@@ -23020,7 +23340,7 @@ static void openPowerMenu() {
 
   auto mk = [&](const char* txt, lv_event_cb_t cb, uint32_t bg, int y) {
     lv_obj_t* b = lv_btn_create(card);
-    lv_obj_set_size(b, card_w - 24, 34);
+    lv_obj_set_size(b, card_w - 24, p_bh);
     lv_obj_align(b, LV_ALIGN_TOP_MID, 0, y);
     styleButton(b);
     if (bg) {
@@ -23035,10 +23355,10 @@ static void openPowerMenu() {
     lv_obj_center(l);
     return b;
   };
-  mk(LV_SYMBOL_POWER "  Power off",        powerOffCb,      0xC44B55, 28);
-  mk(LV_SYMBOL_REFRESH "  Reboot",         powerRebootCb,   0,        68);
-  mk(LV_SYMBOL_DOWNLOAD "  Download mode", powerDownloadCb, 0,        108);
-  mk("Cancel",                             powerCancelCb,   0,        148);
+  mk(LV_SYMBOL_POWER "  Power off",        powerOffCb,      0xC44B55, p_y0);
+  mk(LV_SYMBOL_REFRESH "  Reboot",         powerRebootCb,   0,        p_y0 + p_step);
+  mk(LV_SYMBOL_DOWNLOAD "  Download mode", powerDownloadCb, 0,        p_y0 + 2 * p_step);
+  mk("Cancel",                             powerCancelCb,   0,        p_y0 + 3 * p_step);
 }
 
 static void ccPowerCb(lv_event_t* e) {
@@ -23092,6 +23412,7 @@ static void ccToggle(lv_obj_t* parent, const char* sym, const char* label,
 // brightness slider is available on both.
 #if defined(PIN_TFT_LEDA_CTL) && (PIN_TFT_LEDA_CTL >= 0)
 #define HAS_BACKLIGHT_PWM 1
+#define HAS_CC_BRIGHTNESS 1
 static uint8_t s_brightness_pct = 100;
 static bool    s_bl_pwm_ready   = false;
 constexpr int  kBlPwmChannel    = 6;
@@ -23107,7 +23428,19 @@ static void applyBrightness(uint8_t pct) {
   }
   ledcWrite(kBlPwmChannel, (uint32_t)pct * 255u / 100u);
 }
+#elif defined(HAS_TANMATSU)
+// Tanmatsu: the panel backlight is set by the bsp (CH32 coprocessor), not LEDC.
+#define HAS_CC_BRIGHTNESS 1
+static uint8_t s_brightness_pct = 100;
+static void applyBrightness(uint8_t pct) {
+  if (pct < 5)   pct = 5;
+  if (pct > 100) pct = 100;
+  s_brightness_pct = pct;
+  bsp_input_set_backlight_brightness(pct);
+}
+#endif
 
+#if defined(HAS_CC_BRIGHTNESS)
 static void ccBrightnessCb(lv_event_t* e) {
   applyBrightness((uint8_t)lv_slider_get_value(lv_event_get_target(e)));   // live
 }
@@ -23134,10 +23467,16 @@ static void openControlCenter() {
   // screen can't fit the battery/IP beside the clock, so portrait stacks the
   // header vertically and uses a taller card.
   const bool portrait = (sw < sh);
+#if defined(HAS_TANMATSU)
+  const int card_w = (sw - 40 > 560) ? 560 : (sw - 40);   // way wider on the 800-px panel
+#else
   const int card_w = (sw - 12 > 300) ? 300 : (sw - 12);
+#endif
   lv_obj_t* card = lv_obj_create(s_cc_root);
   lv_obj_remove_style_all(card);
-#if defined(HAS_TDECK_GT911)
+#if defined(HAS_TANMATSU)
+  lv_obj_set_size(card, card_w, 312);   // way bigger: header + brightness + 2×2 toggle grid + sysinfo
+#elif defined(HAS_TDECK_GT911)
   lv_obj_set_size(card, card_w, 200);   // sysinfo + thin brightness slider + 2-row toggle grid (fits 240−22 screen)
 #else
   // Portrait has headroom on the 320-tall screen; make the card taller so the
@@ -23222,7 +23561,7 @@ static void openControlCenter() {
   // Brightness slider takes the first row (just under the date / battery) and the
   // GPS line follows it, so the slider sits ABOVE the GPS line. Boards without a
   // backlight PWM have no slider, so GPS reclaims that first row.
-#if defined(HAS_BACKLIGHT_PWM)
+#if defined(HAS_CC_BRIGHTNESS)
   const int bl_y  = row_y;
   const int gps_y = row_y + 12;
 #else
@@ -23238,7 +23577,7 @@ static void openControlCenter() {
   lv_obj_set_style_text_color(s_cc_gps_label, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
   lv_obj_align(s_cc_gps_label, LV_ALIGN_TOP_LEFT, 0, gps_y);
 
-#if defined(HAS_BACKLIGHT_PWM)
+#if defined(HAS_CC_BRIGHTNESS)
   // ---- Brightness slider (thin; a sun/gear glyph anchors it on the left so it
   //      doesn't cost a separate label row). bl_y is computed above so it sits
   //      directly under the date/battery, just above the GPS line.
@@ -23287,7 +23626,12 @@ static void openControlCenter() {
   if (g_lv.task) ble_on = g_lv.task->isBleEnabled();
   lv_obj_t* row = lv_obj_create(card);
   lv_obj_remove_style_all(row);
-#if defined(HAS_TDECK_GT911)
+#if defined(HAS_TANMATSU)
+  lv_obj_set_size(row, card_w - 20, 170);   // big 2×2 grid of chips
+  lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW_WRAP);
+  lv_obj_set_style_pad_row(row, 10, LV_PART_MAIN);
+  lv_obj_set_style_pad_column(row, 10, LV_PART_MAIN);
+#elif defined(HAS_TDECK_GT911)
   // 2-row grid: 4 chips per row, so chip 5 (Lock) wraps onto a 2nd row. Sits
   // ABOVE the bottom system-info line (-16 offset leaves room for it).
   lv_obj_set_size(row, card_w - 20, 80);
@@ -23308,7 +23652,11 @@ static void openControlCenter() {
   // T-Deck: chips in a 2-row grid. V4: up to 5 chips sized to fit the card width
   // with even gaps (5 chips + 4 gaps across the content width).
   int tw = 66, th = 54;
-#if defined(HAS_TDECK_GT911)
+#if defined(HAS_TANMATSU)
+  tw = (card_w - 20 - 10) / 2;   // 2 big chips per row (Wi-Fi/BT/GPS/Theme → 2×2 grid)
+  if (tw > 270) tw = 270;
+  th = 80;
+#elif defined(HAS_TDECK_GT911)
   tw = 58; th = 36;
 #else
   tw = (card_w - 20 - 4 * 5) / 5;   // 5 chips (Wi-Fi/BT/GPS/Theme/Sound) + 4 gaps
@@ -23631,7 +23979,13 @@ static void addAppTile(lv_obj_t* parent, int x, int y, int w, int h,
   // Rounded-square chip (iOS-style squircle), tinted with the app's accent
   // colour, centred up top. Bigger + a small proportional corner radius so it
   // reads as a SQUARE app icon, not a circle.
+#if defined(HAS_TANMATSU)
+  // Reserve the ACTUAL label line height (it grows with the UI-scale font) so the
+  // name never overlaps the icon chip on the big panel.
+  int chip = h - (lv_font_get_line_height(big ? &g_font_14 : &g_font_12) + 10);
+#else
   int chip = h - (big ? 26 : 22);    // leave one label line beneath (taller in large mode)
+#endif
   if (chip > w - 6)         chip = w - 6;
   if (chip > (big ? 80 : 58)) chip = (big ? 80 : 58);   // higher cap so large-mode chips actually grow
   if (chip < 30)           chip = 30;
@@ -23780,8 +24134,13 @@ static void openAppGridSheet() {
   lv_obj_clear_flag(s_appgrid_sheet, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_event_cb(s_appgrid_sheet, appGridBackdropCb, LV_EVENT_CLICKED, nullptr);
 
+#if defined(HAS_TANMATSU)
+  const int card_w = 380, btn_h = 62, pad = 18, hdr = 38, gap = 12;   // bigger on the 800×480 panel
+  const int home_row = 46;
+#else
   const int card_w = 210, btn_h = 46, pad = 12, hdr = 28, gap = 8;
   const int home_row = 36;   // the "app drawer as home" toggle row below the size buttons
+#endif
   lv_obj_t* card = lv_obj_create(s_appgrid_sheet);
   lv_obj_remove_style_all(card);
   lv_obj_set_size(card, card_w, hdr + 2 * btn_h + gap + home_row + gap + 2 * pad);
@@ -24532,17 +24891,16 @@ static void updateGlobalStatusBar() {
 
   // ---- Clock ----
 #if defined(ESP32)
-  static int s_last_min = -1;
+  static char s_last_clock[12] = {0};
   time_t now_t = time(nullptr);
   if (now_t > 1700000000) {
     struct tm tm_loc;
     localtime_r(&now_t, &tm_loc);
-    const int mod = tm_loc.tm_hour * 60 + tm_loc.tm_min;
-    if (mod != s_last_min) {
-      char buf[8];
-      snprintf(buf, sizeof(buf), "%02d:%02d", tm_loc.tm_hour, tm_loc.tm_min);
+    char buf[12];
+    fmtClockHM(buf, sizeof(buf), &tm_loc);   // honor the 12/24-hour pref; dedup on the string so a toggle re-renders
+    if (strcmp(buf, s_last_clock) != 0) {
       lv_label_set_text(g_statusbar.clock, buf);
-      s_last_min = mod;
+      strncpy(s_last_clock, buf, sizeof(s_last_clock) - 1);
     }
   }
 #endif
@@ -25450,7 +25808,7 @@ static void openAccentPicker() {
   lv_obj_align(close, LV_ALIGN_TOP_RIGHT, -6, 2);
   styleButton(close);
   lv_obj_add_event_cb(close, accentPickerCloseCb, LV_EVENT_CLICKED, nullptr);
-  lv_obj_t* cl = lv_label_create(close); lv_label_set_text(cl, LV_SYMBOL_CLOSE);
+  lv_obj_t* cl = lv_label_create(close); lv_label_set_text(cl, LV_SYMBOL_CLOSE); tanCloseRed(cl);
   lv_obj_set_style_text_font(cl, &g_font_12, LV_PART_MAIN); lv_obj_center(cl);
 
   // Swatch grid: tap a colour (far friendlier on a touchscreen than a wheel).
@@ -25588,7 +25946,7 @@ static void openBlockedUsersModal() {
   lv_obj_align(close, LV_ALIGN_TOP_RIGHT, -6, 4);
   styleButton(close);
   lv_obj_add_event_cb(close, blockedModalCloseCb, LV_EVENT_CLICKED, nullptr);
-  lv_obj_t* cl = lv_label_create(close); lv_label_set_text(cl, LV_SYMBOL_CLOSE);
+  lv_obj_t* cl = lv_label_create(close); lv_label_set_text(cl, LV_SYMBOL_CLOSE); tanCloseRed(cl);
   lv_obj_set_style_text_font(cl, &g_font_12, LV_PART_MAIN); lv_obj_center(cl);
 
   const int n  = touchPrefsCopyIgnored(s_blocked_snap);
@@ -25717,7 +26075,7 @@ static void openChannelScopeModal(int slot, const char* name) {
   lv_obj_align(close, LV_ALIGN_TOP_RIGHT, -6, 4);
   styleButton(close);
   lv_obj_add_event_cb(close, chanScopeCloseCb, LV_EVENT_CLICKED, nullptr);
-  lv_obj_t* cl = lv_label_create(close); lv_label_set_text(cl, LV_SYMBOL_CLOSE);
+  lv_obj_t* cl = lv_label_create(close); lv_label_set_text(cl, LV_SYMBOL_CLOSE); tanCloseRed(cl);
   lv_obj_set_style_text_font(cl, &g_font_12, LV_PART_MAIN); lv_obj_center(cl);
 
   lv_obj_t* nm = lv_label_create(s_chanscope_modal);
@@ -27045,7 +27403,12 @@ static char    s_ui_data_root[16] = "";
 static bool    s_ui_data_resolved = false;
 static bool uiDataFsReady() {
   if (s_ui_data_fs != nullptr) return true;   // cache SUCCESS only — a failed resolve MUST stay retryable
-#if defined(HAS_TDECK_GT911)
+#if defined(HAS_TANMATSU)
+  // Tanmatsu: no SD global + no SPIFFS partition — chat history lives on the internal
+  // 'locfd' FAT partition (mounted at boot in main.cpp; same store as DataStore + the FM).
+  extern bool g_fs_ok;
+  if (g_fs_ok) { s_ui_data_fs = &FFat; s_ui_data_root[0] = '\0'; return true; }
+#elif defined(HAS_TDECK_GT911)
   // T-Deck: the SD card is the persistent user-data store (large, removable,
   // survives a reflash) and is where chat history already lives. Prefer it; only
   // fall back to internal SPIFFS if no card is present. (Do NOT format/prefer
@@ -27871,12 +28234,15 @@ void UITask::backspaceComposerChar() {
   _compose_buf[i] = '\0';
 }
 
-bool UITask::sendComposerToActiveThread() {
+bool UITask::sendComposerToActiveThread(const char* override_text) {
   static uint32_t s_last_ui_tx_ts = 0;
   static uint8_t s_ui_tx_attempt = 4;
-  if (_active_thread_idx < 0 || !_compose_buf[0]) return false;
+  if (_active_thread_idx < 0) return false;
+  // Resend (message action menu) passes the original message text; a normal send uses
+  // the composer draft. On a resend we must NOT clear the composer (a half-typed draft).
+  const char* text = (override_text && override_text[0]) ? override_text : _compose_buf;
+  if (!text[0]) return false;
   const char* sender = (_node_prefs && _node_prefs->node_name[0]) ? _node_prefs->node_name : "me";
-  const char* text   = _compose_buf;
   size_t tlen = strlen(text);
   if (tlen > MAX_TEXT_LEN) tlen = MAX_TEXT_LEN;
   char truncated[MAX_TEXT_LEN + 1];
@@ -27917,7 +28283,7 @@ bool UITask::sendComposerToActiveThread() {
     }
     appendMessage(_ui_threads[_active_thread_idx].name, sender, truncated, true, true, false,
                   0, DELIV_NONE, 0, 0, 0, 0, nullptr, 0, the_mesh.uiLastSentFp());
-    resetComposer();
+    if (!override_text) resetComposer();   // a resend must not wipe a half-typed draft
     showAlert(TR("Sent"), 900);
     return true;
   }
@@ -28008,7 +28374,7 @@ bool UITask::sendComposerToActiveThread() {
   the_mesh.uiRegisterExpectedAck(expected_ack, recipient.id.pub_key);
   appendMessage(_ui_threads[_active_thread_idx].name, sender, truncated, false, true, false,
                 expected_ack, DELIV_SENT, 0, 0, 0, 0, nullptr, 0, the_mesh.uiLastSentFp());
-  resetComposer();
+  if (!override_text) resetComposer();   // a resend must not wipe a half-typed draft
   showAlert(TR("Sent"), 900);
   return true;
 }
@@ -28395,7 +28761,7 @@ void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* no
 #endif
     // Apply the saved backlight brightness (takes the LEDA pin over from the
     // display's digitalWrite via LEDC PWM). Both touch boards have the LEDA pin.
-#if defined(HAS_BACKLIGHT_PWM)
+#if defined(HAS_CC_BRIGHTNESS)
     applyBrightness(touchPrefsGetBrightness());
 #endif
 #if defined(HAS_TDECK_KEYBOARD)
@@ -28517,7 +28883,12 @@ void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* no
     if (lv_indev_t* kp = lv_indev_drv_register(&s_nav_keypad_drv)) lv_indev_set_group(kp, s_nav_group);
     else pushDiagLine("LVGL nav keypad indev failed");
 #if defined(ESP32)
+#if defined(HAS_TANMATSU)
+    s_kbd_nav = true;   // keyboard-only device: nav is always on (no touch to fall back to)
+#else
     s_kbd_nav = touchPrefsGetKbdNav();
+#endif
+    s_nav_mbar_keys = touchPrefsGetNavMenubarKeys();   // menubar letter hints: off by default
     for (int i = 0; i < 5; i++) { uint8_t k = touchPrefsGetNavKey(i);    if (k) s_nav_keys[i] = k; }   // load programmable tab hotkeys
     for (int i = 0; i < 8; i++) { uint8_t k = touchPrefsGetNavDirKey(i); if (k) s_dir_keys[i] = k; }   // load programmable control + scroll keys
 #endif
