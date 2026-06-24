@@ -35,7 +35,7 @@ static bool s_begun = false;
 // short read (→ treat as absent → defaults); `ver` lets later builds add fields.
 static const char* KEY_CFG = "cfg";
 static const uint16_t TOUCH_CFG_MAGIC = 0x5743;   // 'WC' (WadaCfg)
-static const uint8_t  TOUCH_CFG_VER   = 17;  // v2 sig_probe/poll; v3 tz_zone; v4 hide_node_name; v5 map_night/map_zoom; v6 map text/marker visibility; v7 app_grid_large; v8 ui_scale; v9 tb_keypad; v10 sleep_idle; v11 nav_keys; v12 map_zoom_buttons; v13 nav_dir_keys; v14 home_is_drawer; v15 kbd_nav default ON (one-time migrate); v16 nav_scroll_keys; v17 notify_new_contact
+static const uint8_t  TOUCH_CFG_VER   = 18;  // v2 sig_probe/poll; v3 tz_zone; v4 hide_node_name; v5 map_night/map_zoom; v6 map text/marker visibility; v7 app_grid_large; v8 ui_scale; v9 tb_keypad; v10 sleep_idle; v11 nav_keys; v12 map_zoom_buttons; v13 nav_dir_keys; v14 home_is_drawer; v15 kbd_nav default ON (one-time migrate); v16 nav_scroll_keys; v17 notify_new_contact; v18 kbd_nav OFF by default (reverses v15; T-Deck/V4 only, Tanmatsu stays on)
 
 // Defaults (kept identical to the historical per-key defaults).
 static const uint16_t DEFAULT_SCREEN_TIMEOUT_S = 20;
@@ -146,7 +146,11 @@ static void cfgSetDefaults(TouchCfg& c) {
   c.map_show_contacts = 1;
   c.app_grid_large    = 0;      // default: compact app grid (T-Deck 4 cols / V4 3 cols)
   c.ui_scale          = 0;      // default: 100% UI scale (native resolution)
-  c.kbd_nav           = 1;      // default: keyboard navigation ON (v15)
+#if defined(HAS_TANMATSU)
+  c.kbd_nav           = 1;      // Tanmatsu: no touchscreen — keyboard nav is the only input, always on
+#else
+  c.kbd_nav           = 0;      // T-Deck / V4: keyboard navigation OFF by default (opt-in; persists once toggled on)
+#endif
   c.sleep_idle        = 0;      // default: idle light-sleep OFF
   { const char* d = "ertui"; for (int i = 0; i < 5; i++) c.nav_keys[i] = (uint8_t)d[i]; }  // default tab hotkeys E/R/T/U/I
   c.map_zoom_buttons  = 0;      // default: map zoom = slider
@@ -202,10 +206,14 @@ static void cfgLoadOrMigrate() {
         // to the real Custom index on the first touchPrefsGetTimezone() call (the
         // zone count isn't known here). offset 0 stays zone 0 (Europe) = unchanged.
         if (s_cfg.ver < 3 && s_cfg.time_offs != 0) s_cfg.tz_zone = 0xFE;
-        // v15: keyboard navigation is now ON by default. Force it on ONCE for existing
-        // users (pre-v15) so they get the feature; their later explicit on/off then
-        // persists (this only fires for ver < 15, never again).
-        if (s_cfg.ver < 15) s_cfg.kbd_nav = 1;
+        // v18: keyboard navigation is now OFF by default (it was force-enabled at v15, but it
+        // complicated the touch UX more than it helped). Reset existing installs to off ONCE so
+        // they match the new default; the user's later explicit on/off then persists (fires only
+        // for ver < 18, never again). The Tanmatsu is exempt — it has no touchscreen, so keyboard
+        // nav is its only input and must stay on.
+#if !defined(HAS_TANMATSU)
+        if (s_cfg.ver < 18) s_cfg.kbd_nav = 0;
+#endif
         s_cfg.ver = TOUCH_CFG_VER;
         s_cfg.magic = TOUCH_CFG_MAGIC;
         cfgFlush();                // rewrite with new fields defaulted-in
