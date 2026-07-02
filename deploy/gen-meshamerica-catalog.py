@@ -44,9 +44,13 @@ if os.path.exists(nf):
 
 # Both touch boards are ESP32-S3, single touch-UI ("gui") role. ota_0 sits at
 # 0x10000 on both (partitions_t*_touch.csv), so flash-update@0x10000 is correct.
+# `name` MUST match the official MeshCore device name character-for-character, or Mesh America lists it
+# as a NEW device instead of folding our firmware into the existing tile (TJ Downes, 2026-06). Canonical
+# names verified from apps.meshamerica.com/proxy/flasher/config.json. The V4 entry is the Expansion Kit
+# (Touch) variant only, per Kaj. `slug` still maps to our bin filenames on firmware.wadamesh.com.
 BOARDS = [
-    {"name": "wadamesh — Heltec V4 TFT", "slug": "heltec-v4-tft"},
-    {"name": "wadamesh — LilyGo T-Deck", "slug": "tdeck"},
+    {"name": "Heltec v4 + Expansion Kit (Touch)", "slug": "heltec-v4-tft"},
+    {"name": "LilyGo T-Deck", "slug": "tdeck"},
 ]
 
 def device(b):
@@ -74,7 +78,16 @@ def device(b):
         }],
     }
 
+# Optional "what's this?" blurb Mesh America shows on a hover tooltip next to our provider badge
+# (spec section 3, added by TJ 2026-06-30). Plain text only — rendered escaped, so no markup/links.
+DESCRIPTION = (
+    "WADAMESH is a full touch-screen interface for MeshCore: on-device chat, contacts, a live map "
+    "with offline tiles, and complete radio settings. Same MeshCore protocol and phone-app companion "
+    "as stock MeshCore, just a richer on-device front-end."
+)
+
 catalog = {
+    "description": DESCRIPTION,
     "maker":  {"wadamesh": {"name": "wadamesh"}},
     "device": [device(b) for b in BOARDS],
 }
