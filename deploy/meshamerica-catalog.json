@@ -17,19 +17,19 @@
           "role": "gui",
           "title": "Touch UI",
           "version": {
-            "beta_31": {
-              "notes": "The chats tab has a fresh look: each conversation now shows a round avatar in that chat's signature colour (the same colour its bubbles use) with the first two letters of the name, the last message previewed under the name, the time top right and the unread count below it. Compact chat mode keeps the dense single-line rows instead, so both styles are available.\nChannels can have a custom icon: open the channel's settings (long-press or the gear) and tap \"Chat icon\" to pick any emoji as its avatar. Long-press the same entry to go back to the automatic letters. The choice is remembered per channel.\nLong chat names no longer wrap onto the message preview underneath.",
+            "beta_33": {
+              "notes": "The freezes with MQTT enabled are gone. Connecting to the broker (DNS lookup, TCP connect, login) could block the device for 2-10 seconds and retried every 15 seconds while the broker was unreachable, all on the UI thread. Connection attempts now run fully in the background, and writes to a broker that stops responding are skipped instead of waited on (the same treatment beta_32 gave phone/web connections). Tip: if your bridge keeps reconnecting, check the broker address and credentials - a healthy connection does not retry.\nThe About page caused a ~0.4 second hitch every second while it was open: computing the firmware image size checksums the whole ~3 MB app in flash and ran twice per refresh. It is now computed once per boot, so About (and its stall list) no longer disturbs the very measurements it shows.\nFavoriting a contact when the favorites list is full (16) now says \"Favorites full (max 16)\" instead of the incorrect \"Removed from favorites\".",
               "files": [
                 {
                   "type": "flash-wipe",
                   "name": "wadamesh-heltec-v4-tft-merged.bin",
-                  "url": "https://firmware.wadamesh.com/releases/TOUCH/beta_31/wadamesh-heltec-v4-tft-merged.bin",
+                  "url": "https://firmware.wadamesh.com/releases/TOUCH/beta_33/wadamesh-heltec-v4-tft-merged.bin",
                   "title": "Full install (bootloader + firmware)"
                 },
                 {
                   "type": "flash-update",
                   "name": "wadamesh-heltec-v4-tft.bin",
-                  "url": "https://firmware.wadamesh.com/releases/TOUCH/beta_31/wadamesh-heltec-v4-tft.bin",
+                  "url": "https://firmware.wadamesh.com/releases/TOUCH/beta_33/wadamesh-heltec-v4-tft.bin",
                   "title": "Update (app only)"
                 }
               ]
@@ -49,19 +49,19 @@
           "role": "gui",
           "title": "Touch UI",
           "version": {
-            "beta_31": {
-              "notes": "The chats tab has a fresh look: each conversation now shows a round avatar in that chat's signature colour (the same colour its bubbles use) with the first two letters of the name, the last message previewed under the name, the time top right and the unread count below it. Compact chat mode keeps the dense single-line rows instead, so both styles are available.\nChannels can have a custom icon: open the channel's settings (long-press or the gear) and tap \"Chat icon\" to pick any emoji as its avatar. Long-press the same entry to go back to the automatic letters. The choice is remembered per channel.\nLong chat names no longer wrap onto the message preview underneath.",
+            "beta_33": {
+              "notes": "The freezes with MQTT enabled are gone. Connecting to the broker (DNS lookup, TCP connect, login) could block the device for 2-10 seconds and retried every 15 seconds while the broker was unreachable, all on the UI thread. Connection attempts now run fully in the background, and writes to a broker that stops responding are skipped instead of waited on (the same treatment beta_32 gave phone/web connections). Tip: if your bridge keeps reconnecting, check the broker address and credentials - a healthy connection does not retry.\nThe About page caused a ~0.4 second hitch every second while it was open: computing the firmware image size checksums the whole ~3 MB app in flash and ran twice per refresh. It is now computed once per boot, so About (and its stall list) no longer disturbs the very measurements it shows.\nFavoriting a contact when the favorites list is full (16) now says \"Favorites full (max 16)\" instead of the incorrect \"Removed from favorites\".",
               "files": [
                 {
                   "type": "flash-wipe",
                   "name": "wadamesh-tdeck-merged.bin",
-                  "url": "https://firmware.wadamesh.com/releases/TOUCH/beta_31/wadamesh-tdeck-merged.bin",
+                  "url": "https://firmware.wadamesh.com/releases/TOUCH/beta_33/wadamesh-tdeck-merged.bin",
                   "title": "Full install (bootloader + firmware)"
                 },
                 {
                   "type": "flash-update",
                   "name": "wadamesh-tdeck.bin",
-                  "url": "https://firmware.wadamesh.com/releases/TOUCH/beta_31/wadamesh-tdeck.bin",
+                  "url": "https://firmware.wadamesh.com/releases/TOUCH/beta_33/wadamesh-tdeck.bin",
                   "title": "Update (app only)"
                 }
               ]
