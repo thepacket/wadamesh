@@ -1,4 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+//
+// Lives in its own folder, separate from variants/lilygo_tlora_pager/ (our
+// board glue: TLoraPagerBoard.*, target.*, CustomLR1121*), because PlatformIO's
+// arduino-esp32 build script unconditionally compiles every source file found
+// under board_build.variants_dir/<board.variant>/ as a standalone "framework
+// variant" library (platformio-build.py's corelib_env.BuildSources call) --
+// a build context with none of our own lib_deps include paths. Since this
+// board has no framework-bundled variant, we must point variants_dir at our
+// own repo; keeping this pin map alone in board.variant's folder means that
+// auto-compile step finds nothing but a header (a no-op), while our .cpp
+// files stay reachable only through our own build_src_filter, exactly once.
 #ifndef Pins_Arduino_h
 #define Pins_Arduino_h
 

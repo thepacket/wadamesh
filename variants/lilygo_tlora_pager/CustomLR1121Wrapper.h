@@ -5,8 +5,13 @@
 #pragma once
 
 #include "CustomLR1121.h"
-#include "RadioLibWrappers.h"
-#include "LR11x0Reset.h"
+// Angle brackets with the full core-lib subpath, NOT the core's own bare
+// quoted "RadioLibWrappers.h" -- CustomLR1110Wrapper.h gets away with that
+// because it lives in the same src/helpers/radiolib/ directory (quote-include
+// searches the including file's own dir first); this file lives in the
+// variant dir instead, so a bare quoted include can't find them.
+#include <helpers/radiolib/RadioLibWrappers.h>
+#include <helpers/radiolib/LR11x0Reset.h>
 
 class CustomLR1121Wrapper : public RadioLibWrapper {
 public:

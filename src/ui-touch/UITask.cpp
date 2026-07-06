@@ -95,6 +95,8 @@
   #include "qr_icon.h"        // baked recolour-able QR glyph (qr_icon_dsc) for the Chats Share button
   #if defined(HAS_TANMATSU)
     #include <TanmatsuDisplay.h>             // badge-bsp-backed DisplayDriver (P4)
+  #elif defined(TLORA_PAGER)
+    #include <helpers/ui/ST7796LCDDisplay.h>
   #else
     #include <helpers/ui/ST7789LCDDisplay.h>
   #endif
@@ -123,6 +125,8 @@
   #endif
   #if defined(HAS_TANMATSU)
     extern TanmatsuDisplay display;
+  #elif defined(TLORA_PAGER)
+    extern ST7796LCDDisplay display;
   #else
     extern ST7789LCDDisplay display;
   #endif
