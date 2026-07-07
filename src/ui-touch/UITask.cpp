@@ -2199,7 +2199,7 @@ static lv_obj_t* s_nav_objs[kNavMax] = { nullptr };
 static lv_obj_t* s_nav_tabbar   = nullptr;     // the bottom tab bar (btnmatrix), added last to the group
 static bool      s_nav_want_tabbar = false;    // after switching tabs from the bar, refocus the bar
 static lv_obj_t* s_nav_styled   = nullptr;     // obj currently wearing the focus highlight
-#if defined(HAS_TANMATSU)
+#if defined(HAS_TANMATSU) || defined(TLORA_PAGER)
 static bool      s_nav_show     = true;        // keyboard-only device: focus highlight is always visible
 #else
 static bool      s_nav_show     = false;       // T-Deck: focus-visible — paint only while keyboard-navigating (hidden after a touch/click)
@@ -28227,7 +28227,7 @@ static void handleHwKey(int key) {
     // goes through hideKb(); this covers the physical-keyboard Enter.
     accentBoxHide();
     mentionBoxHide();
-#if defined(HAS_TDECK_GT911)
+#if defined(HAS_TDECK_GT911) || defined(TLORA_PAGER)
     if (s_editor_ta && ta == s_editor_ta) {
       lv_textarea_add_char(ta, '\n');   // multiline editor: Enter inserts a newline
     } else if (s_term_input_ta && s_kb_bind_ta == s_term_input_ta) {
