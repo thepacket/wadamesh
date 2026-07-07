@@ -26930,6 +26930,11 @@ static void updatePagerEncoder(unsigned long now) {
     if (delta != 0 || held) g_lv.task->wakeScreen();
     return;
   }
+  // Screen already on: turning/clicking the encoder is real activity too, same as a
+  // keypress -- without this the idle timer kept counting down through continuous
+  // rotary navigation (nothing else on this board resets it; see handleHwKey()'s
+  // matching TLORA_PAGER fix) and the screen dimmed mid-use.
+  if ((delta != 0 || held) && g_lv.task) g_lv.task->noteUserInput();
 
   for (; delta > 0; delta--) navPushTap(LV_KEY_NEXT);
   for (; delta < 0; delta++) navPushTap(LV_KEY_PREV);
@@ -28087,6 +28092,17 @@ static void handleHwKey(int key) {
   if (g_lv.task && g_lv.task->isManualLock()) { g_lv.task->lockscreenReveal(); return; }
   // Idle-dimmed (not hard-locked): ignore keys; a touch/click wakes into the UI.
   if (g_lv.task && g_lv.task->isScreenOff()) return;
+#if defined(TLORA_PAGER)
+  // No touch and no trackball on this board: every OTHER input path that resets the
+  // idle timer (touch taps, trackball moves) doesn't exist here, and below this point
+  // a keypress only calls noteUserInput() when it lands in a focused field, dismisses
+  // a popup, or matches a tab hotkey -- tabForKey() no longer maps any letters (tab
+  // jumps moved to the trackball-only programmable hotkeys) and isDismissKey() always
+  // returns false on this full QWERTY, so with no field focused EVERY key silently
+  // no-op'd here and the idle timer kept counting down while the user was actively
+  // pressing keys (reported bug: screen dims after ~30s despite keyboard input).
+  if (g_lv.task) g_lv.task->noteUserInput();
+#endif
 #if CAP_TRACKBALL
   // Remapping a tab hotkey (Settings → Keyboard): capture the next key press.
   if (s_navkey_capture >= 0) { navKeyCaptureApply(key); return; }
