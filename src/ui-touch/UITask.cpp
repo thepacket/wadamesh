@@ -7201,22 +7201,51 @@ static void saveRadioParamsCb(lv_event_t* e) {
     if (!silent) g_lv.task->showAlert(m, 1500);
     if (g_set_modal.tx_ta) { char v[8]; snprintf(v, sizeof v, "%d", tx); lv_textarea_set_text(g_set_modal.tx_ta, v); }   // reflect the clamp in the field
   }
+  // Region scope — trimmed the same way it's persisted, so it can be compared below.
+  char region[TOUCH_REGION_SCOPE_MAXLEN] = {0};
+  const bool has_region_ta = (g_set_modal.region_ta != nullptr);
+  if (has_region_ta) {
+    strncpy(region, lv_textarea_get_text(g_set_modal.region_ta), sizeof(region) - 1);
+    char* r = region;                                    // trim so the stored name matches the key
+    while (*r == ' ' || *r == '\t') r++;
+    size_t rl = strlen(r);
+    while (rl && (r[rl-1]==' '||r[rl-1]=='\t'||r[rl-1]=='\n'||r[rl-1]=='\r')) r[--rl] = '\0';
+    memmove(region, r, strlen(r) + 1);
+  }
+#if defined(TLORA_PAGER)
+  // Blur auto-save fires on EVERY field defocus, including pure keyboard/encoder nav that
+  // never edits anything (no touch fallback on the pager — moving focus off a field IS a
+  // defocus). Skip the flash write + live radio SPI reconfigure when nothing actually
+  // changed, so tabbing through this row doesn't retrigger a several-hundred-ms-to-
+  // multi-second radio reinit per field — observed on hardware as escalating
+  // [STALL] ui:lvgl entries while navigating this screen with no edits made. Touch boards
+  // don't hit this (a field only blurs on a deliberate tap-out after an edit), so they
+  // keep the original always-save-on-blur behavior.
+  if (silent) {
+    NodePrefs* prefs = the_mesh.getNodePrefs();
+    char cur_region[TOUCH_REGION_SCOPE_MAXLEN] = {0};
+    if (has_region_ta) touchPrefsGetRegionScope(cur_region, sizeof(cur_region));
+    const bool unchanged = prefs
+        && std::fabs(prefs->freq - freq) <= 0.002
+        && std::fabs(prefs->bw - bw) <= 0.02
+        && prefs->sf == (uint8_t)sf
+        && prefs->cr == (uint8_t)cr
+        && prefs->tx_power_dbm == (int8_t)tx
+        && std::fabs(static_cast<double>(prefs->airtime_factor) - af) <= 0.005
+        && (!has_region_ta || strcmp(cur_region, region) == 0);
+    if (unchanged) return;
+  }
+#endif
   bool ok = g_lv.task->setRadioParams(freq, bw, static_cast<uint8_t>(sf), static_cast<uint8_t>(cr),
                                       static_cast<int8_t>(tx), af);
   // Region scope — independent of the freq/SF values above. Derive + persist the
   // flood-scope key from the typed "#region" (blank clears it back to unscoped),
   // and remember the display name for next time the form is shown.
   bool has_region = false;
-  if (g_set_modal.region_ta) {
-    char region[TOUCH_REGION_SCOPE_MAXLEN] = {0};
-    strncpy(region, lv_textarea_get_text(g_set_modal.region_ta), sizeof(region) - 1);
-    char* r = region;                                    // trim so the stored name matches the key
-    while (*r == ' ' || *r == '\t') r++;
-    size_t rl = strlen(r);
-    while (rl && (r[rl-1]==' '||r[rl-1]=='\t'||r[rl-1]=='\n'||r[rl-1]=='\r')) r[--rl] = '\0';
-    the_mesh.setDefaultFloodScope(r);
-    touchPrefsSetRegionScope(r);
-    has_region = (r[0] != '\0');
+  if (has_region_ta) {
+    the_mesh.setDefaultFloodScope(region);
+    touchPrefsSetRegionScope(region);
+    has_region = (region[0] != '\0');
   }
   if (ok) {
     if (!silent) g_lv.task->showAlert(has_region ? TR("Radio + region set") : TR("Radio applied"), 1000);
