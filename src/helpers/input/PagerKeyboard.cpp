@@ -22,7 +22,7 @@
 // character at that position (dead cell, or intercepted as a modifier below).
 static constexpr char s_keymap[KB_ROWS][KB_COLS] = {
   {'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p'},
-  {'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', '\n'},
+  {'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', '\r'},
   {'\0', 'z', 'x', 'c', 'v', 'b', 'n', 'm', '\0', '\0'},
   {' ',  '\0', '\0', '\0', '\0', '\0', '\0', '\0', '\0', '\0'},
 };
@@ -46,7 +46,10 @@ static constexpr uint8_t kBackspacePos = 2 * KB_COLS + 9; // row2,col9 ('\0' in 
 static Adafruit_TCA8418 s_kb;
 static bool s_inited = false;
 static bool s_alt = false;
+static bool s_alt_used = false;         // Alt consumed as a modifier since it was last pressed
+static bool s_alt_tap_pending = false;  // Alt pressed+released with nothing else happening meanwhile
 static bool s_caps = false;
+static bool s_backspace_held = false;
 
 // Single-producer (poll) / single-consumer (UI thread) ring — same pattern as
 // TDeckKeyboard.cpp; byte indices are atomic enough for SPSC without a lock.
@@ -90,9 +93,19 @@ void pagerKeyboardPoll() {
     const bool pressed = (raw & 0x80) != 0;
     const uint8_t code = (uint8_t)((raw & 0x7F) - 1);
 
-    if (code == kAltPos)  { s_alt = pressed; continue; }
+    if (code == kAltPos) {
+      // Solo tap (press+release, nothing else in between) vs. a modifier hold
+      // (symbol-layer typing, or the rotary encoder's Alt+turn via
+      // pagerKeyboardMarkAltUsed()) — only the former queues a pending tap.
+      if (pressed) { s_alt = true; s_alt_used = false; }
+      else { if (!s_alt_used) s_alt_tap_pending = true; s_alt = false; }
+      continue;
+    }
+    // Any other key event while Alt is held means Alt is being used as a
+    // modifier, not tapped solo — cancels the pending-tap interpretation.
+    if (s_alt && pressed) s_alt_used = true;
     if (code == kCapsPos) { if (pressed) s_caps = !s_caps; continue; }
-    if (code == kBackspacePos) { if (pressed) ringPush('\b'); continue; }
+    if (code == kBackspacePos) { s_backspace_held = pressed; if (pressed) ringPush('\b'); continue; }
     if (!pressed) continue;   // base/symbol keys only emit on press
 
     const uint8_t row = code / KB_COLS;
@@ -123,5 +136,15 @@ void pagerKeyboardSetBacklight(uint8_t level) {
 }
 
 bool pagerKeyboardAltHeld() { return s_alt; }
+
+void pagerKeyboardMarkAltUsed() { s_alt_used = true; }
+
+bool pagerKeyboardConsumeAltTap() {
+  if (!s_alt_tap_pending) return false;
+  s_alt_tap_pending = false;
+  return true;
+}
+
+bool pagerKeyboardBackspaceHeld() { return s_backspace_held; }
 
 #endif

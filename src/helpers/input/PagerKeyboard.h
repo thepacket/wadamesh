@@ -44,4 +44,22 @@ void pagerKeyboardSetBacklight(uint8_t level);
  *  without a second, separate modifier concept. */
 bool pagerKeyboardAltHeld();
 
+/** Mark the currently-held Alt as "used as a modifier" — call this when some
+ *  other gesture (e.g. the rotary encoder's Alt+turn) consumes the hold, so
+ *  releasing Alt afterward isn't also read as a solo tap by
+ *  pagerKeyboardConsumeAltTap(). */
+void pagerKeyboardMarkAltUsed();
+
+/** One-shot: true exactly once if Alt was pressed and released without being
+ *  used as a modifier for anything else in between (no key typed, no
+ *  pagerKeyboardMarkAltUsed() call) — a "solo tap", distinct from a
+ *  symbol-layer or Alt+turn hold. Consumes the pending flag on read. */
+bool pagerKeyboardConsumeAltTap();
+
+/** True while Backspace is physically held (raw state, mirrors
+ *  pagerKeyboardAltHeld()). A press still immediately ring-pushes '\b' as
+ *  before; this is for callers that want to detect a long hold separately
+ *  (e.g. UITask's press-and-hold "back" gesture). */
+bool pagerKeyboardBackspaceHeld();
+
 #endif

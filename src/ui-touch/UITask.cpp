@@ -8151,7 +8151,7 @@ static void buildRadioSettings() {
     g_set_modal.freq_ta = mk_ta(fw, 0,        "MHz", 15);
     g_set_modal.bw_ta   = mk_ta(fw, fw + g,   "kHz", 10);
   }
-  y += SC(36);
+  y += SC(44);   // was SC(36): only left a 6px gap below the 30px-tall boxes, crowding the label below
   mk_label("SF / CR / TX / AF");
   {
     const int g = 6, fw = (cw - 3 * g) / 4;       // four equal fields filling the row
@@ -26949,6 +26949,58 @@ static void updateTrackball(unsigned long now) {
 }
 #endif
 
+#if defined(HAS_PAGER_ENCODER) || defined(HAS_PAGER_KEYBOARD)
+// "Back", extending the T-Deck/Tanmatsu back-key ladder: a popup/sheet on top
+// closes first, then an open chat/channel detail, then Home (the pager has no
+// dedicated Home hotkey and the bottom tab bar isn't a nav-group target, so a
+// bare main tab otherwise had no way back to Home), else plain ESC. Shared by
+// the rotary encoder's long-press (updatePagerEncoder) and the keyboard's
+// Backspace-hold alternative (updatePagerBackspaceHold) so both agree exactly.
+static void pagerNavGoBack() {
+  if (anyPopupOpen())                            hwKeyDismissTopPopup();
+  else if (LvChatPanel* cp = navOpenChatPanel()) closeChatPanel(cp);
+  else if (getActiveTab() != HOME_TAB_INDEX)     navGoToMainTab(HOME_TAB_INDEX);
+  else                                           navPushTap(LV_KEY_ESC);
+}
+#endif
+
+#if defined(HAS_PAGER_KEYBOARD)
+// Backspace press-and-hold = the same "back" as the encoder's long-press —
+// an alternative for users wary of wearing out the rotary encoder. Same
+// 1000 ms state machine as the encoder's click handling below; a short tap
+// still deletes a character as normal (PagerKeyboard ring-pushes '\b' on
+// press, unchanged).
+static void updatePagerBackspaceHold(unsigned long now) {
+  if (g_lv.task && g_lv.task->isScreenOff()) return;
+  const bool held = pagerKeyboardBackspaceHeld();
+  static constexpr uint32_t kLongPressMs = 1000;
+  static bool     s_was_held    = false;
+  static uint32_t s_press_start = 0;
+  static bool     s_long_fired  = false;
+
+  if (held && !s_was_held) {
+    s_press_start = now;
+    s_long_fired  = false;
+  } else if (held && !s_long_fired && (now - s_press_start) >= kLongPressMs) {
+    pagerNavGoBack();
+    if (g_lv.task) g_lv.task->noteUserInput();
+    s_long_fired = true;
+  }
+  s_was_held = held;
+}
+
+// Orange/Alt key, tapped alone (not held as a symbol-layer modifier or for the
+// encoder's Alt+turn) = the same "next field" as one rotary NEXT detent. Call
+// once per loop tick while the screen is on; screen-off handling discards any
+// pending tap instead (see loop()'s HAS_PAGER_KEYBOARD branch) so a stray tap
+// picked up while idle-dimmed can't fire the moment the screen wakes.
+static void updatePagerAltTapNext() {
+  if (!pagerKeyboardConsumeAltTap()) return;
+  navPushTap(LV_KEY_NEXT);
+  if (g_lv.task) g_lv.task->noteUserInput();
+}
+#endif
+
 #if defined(HAS_PAGER_ENCODER)
 // T-LoRa Pager rotary encoder: a single linear nav axis (not 2D like the
 // trackball, so none of updateTrackball()'s game/emoji-grid/cursor special
@@ -26982,6 +27034,10 @@ static void updatePagerEncoder(unsigned long now) {
   // rotary navigation (nothing else on this board resets it; see handleHwKey()'s
   // matching TLORA_PAGER fix) and the screen dimmed mid-use.
   if ((delta != 0 || held) && g_lv.task) g_lv.task->noteUserInput();
+
+  // Alt+turn is a modifier combo, not a solo Alt tap -- mark it used so a
+  // release right after this doesn't ALSO fire updatePagerAltTapNext()'s NEXT.
+  if (pagerKeyboardAltHeld() && delta != 0) pagerKeyboardMarkAltUsed();
 
   if (pagerKeyboardAltHeld() && navOnMainPage()) {
     // Alt (the bottom-left orange key, otherwise a hold-only modifier for the
@@ -27030,19 +27086,7 @@ static void updatePagerEncoder(unsigned long now) {
     s_press_start = now;
     s_long_fired  = false;
   } else if (held && !s_long_fired && (now - s_press_start) >= kLongPressMs) {
-    // "Back", extending the T-Deck/Tanmatsu back-key ladder: a popup/sheet on top
-    // closes first, then an open chat/channel detail. Unlike those boards, the
-    // pager has no dedicated Home hotkey (T-Deck/Tanmatsu reach Home via their
-    // own programmable/coloured keys, not this "back" key) and the bottom tab
-    // bar is deliberately not a nav-group target, so a BARE main tab (Chats,
-    // Contacts, Map, Settings, …) had no way back to Home at all. Fall back to
-    // Home before plain ESC — matches every other "close" path in this app
-    // (the Terminal/Files Home button, the fullscreen-view popup closer) already
-    // landing on Home rather than a real back-stack.
-    if (anyPopupOpen())                            hwKeyDismissTopPopup();
-    else if (LvChatPanel* cp = navOpenChatPanel()) closeChatPanel(cp);
-    else if (getActiveTab() != HOME_TAB_INDEX)     navGoToMainTab(HOME_TAB_INDEX);
-    else                                           navPushTap(LV_KEY_ESC);
+    pagerNavGoBack();   // see pagerNavGoBack() above for the ladder + rationale
     s_long_fired = true;
   } else if (!held && s_was_held && !s_long_fired) {
     navPushTap(LV_KEY_ENTER);   // released before the long-press threshold -> short click
@@ -28218,6 +28262,18 @@ static void handleHwKey(int key) {
   lv_obj_t* ta = ta_focused;
 #endif
   if (!ta) {
+#if defined(TLORA_PAGER)
+    // No field is bound to the on-screen keyboard, so nav focus is on a plain
+    // widget (button/switch/list row). Enter = the same "submit/click" the
+    // encoder's short click already sends via navPushTap(LV_KEY_ENTER) --
+    // works during the setup wizard too, matching encoder parity (hence
+    // ahead of the s_setup_root check below).
+    if (key == 0x0D) {
+      navPushTap(LV_KEY_ENTER);
+      if (g_lv.task) g_lv.task->noteUserInput();
+      return;
+    }
+#endif
 #if CAP_TRACKBALL
     // A field is focused but we're in navigate mode: select/Enter starts editing it, so the
     // letter-nav keys keep navigating until you explicitly enter the field (matches navPump).
@@ -37648,6 +37704,9 @@ void UITask::loop() {
       if (pagerKeyboardReadKey() <= 0) break;
       any = true;
     }
+    // Discard any Alt tap picked up while idle-dimmed -- it must not fire
+    // updatePagerAltTapNext()'s NEXT the instant the screen wakes.
+    pagerKeyboardConsumeAltTap();
     if (any) g_lv.task->wakeScreen();
   } else {
     for (int kbi = 0; kbi < 12; ++kbi) {
@@ -37655,6 +37714,8 @@ void UITask::loop() {
       if (key <= 0) break;
       handleHwKey(key);
     }
+    updatePagerAltTapNext();
+    updatePagerBackspaceHold(now);
   }
 #endif
 #if defined(HAS_TANMATSU)
