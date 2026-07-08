@@ -2935,6 +2935,23 @@ static lv_obj_t* navOpenDropdown() {
   return nullptr;
 }
 
+#if defined(HAS_TANMATSU) || defined(TLORA_PAGER)
+// Enter on a focused chat bubble = the same per-message action menu the T-Deck opens on a
+// long-press (Copy / Info / …). Bubbles are the focusable leaves inside the chat's msgs
+// container, so identify one by its parent. Returns true if it handled the Enter. Shared by
+// Tanmatsu's navPump() (below) and the pager's handleHwKey() Enter branch — board-agnostic,
+// only touches s_nav_group/navOpenChatPanel/plain lv_obj calls.
+static bool navEnterBubble() {
+  lv_obj_t* foc = s_nav_group ? lv_group_get_focused(s_nav_group) : nullptr;
+  LvChatPanel* cp = navOpenChatPanel();
+  if (cp && cp->msgs && foc && lv_obj_is_valid(foc) && lv_obj_get_parent(foc) == cp->msgs) {
+    lv_event_send(foc, LV_EVENT_LONG_PRESSED, nullptr);
+    return true;
+  }
+  return false;
+}
+#endif
+
 #if defined(HAS_TANMATSU)   // bsp-input driven; on the T-Deck navFifo is fed from the trackball instead
 // The UP/DOWN/LEFT/RIGHT action, factored out so a HELD arrow can auto-repeat it (navPump's
 // per-frame tick re-fires this). Recomputes the focused field each call so repeat stays correct.
@@ -2956,19 +2973,6 @@ static void navArrowAction(uint32_t key) {
       break;
     default: break;
   }
-}
-
-// Enter on a focused chat bubble = the same per-message action menu the T-Deck opens on a
-// long-press (Copy / Info / …). Bubbles are the focusable leaves inside the chat's msgs
-// container, so identify one by its parent. Returns true if it handled the Enter.
-static bool navEnterBubble() {
-  lv_obj_t* foc = s_nav_group ? lv_group_get_focused(s_nav_group) : nullptr;
-  LvChatPanel* cp = navOpenChatPanel();
-  if (cp && cp->msgs && foc && lv_obj_is_valid(foc) && lv_obj_get_parent(foc) == cp->msgs) {
-    lv_event_send(foc, LV_EVENT_LONG_PRESSED, nullptr);
-    return true;
-  }
-  return false;
 }
 
 static void navPump() {
@@ -28613,11 +28617,38 @@ static void handleHwKey(int key) {
     // widget (button/switch/list row). Enter = the same "submit/click" the
     // encoder's short click already sends via navPushTap(LV_KEY_ENTER) --
     // works during the setup wizard too, matching encoder parity (hence
-    // ahead of the s_setup_root check below).
+    // ahead of the s_setup_root check below). EXCEPT on a focused chat
+    // bubble, which has no touch/trackball to long-press here -- Enter opens
+    // the same Ack/Mention/Copy/Info/Block action menu instead (navEnterBubble,
+    // shared with Tanmatsu's identical Enter-on-bubble handling).
     if (key == 0x0D) {
-      navPushTap(LV_KEY_ENTER);
+      if (!navEnterBubble()) navPushTap(LV_KEY_ENTER);
       if (g_lv.task) g_lv.task->noteUserInput();
       return;
+    }
+    // Jump to latest: this board has no touch to tap the floating "scroll to
+    // bottom" circle (LvChatPanel::jump_btn) that appears once you've
+    // scrolled up in a chat, so a plain Backspace tap does the same jump +
+    // hide the T-Deck's own jumpToLatestCb() does on click (mirrors the
+    // Tanmatsu F6 hardware-key handler above, plus the hide step that one is
+    // missing). Only intercepted while the button is actually showing, so a
+    // Backspace tap at the bottom of the chat (or outside a chat) still falls
+    // through to its normal no-op / hold-to-back behavior below. Also moves
+    // nav focus to the composer -- without touch, nav focus was left sitting
+    // on whichever message bubble was focused pre-jump, so typing a reply
+    // right after catching up meant first navigating there manually.
+    if (key == 0x08) {
+      LvChatPanel* cp = navOpenChatPanel();
+      if (cp && cp->msgs && cp->jump_btn && !lv_obj_has_flag(cp->jump_btn, LV_OBJ_FLAG_HIDDEN)) {
+        lv_obj_scroll_to_y(cp->msgs, LV_COORD_MAX, LV_ANIM_ON);
+        lv_obj_add_flag(cp->jump_btn, LV_OBJ_FLAG_HIDDEN);
+        if (cp->composer_ta && lv_obj_is_valid(cp->composer_ta)) {
+          lv_group_focus_obj(cp->composer_ta);
+          s_nav_show = true;
+        }
+        if (g_lv.task) g_lv.task->noteUserInput();
+        return;
+      }
     }
     // Slider nudge: this board has no touch/trackball to drag a slider's
     // knob, so a focused lv_slider (Control Center brightness, a Settings
