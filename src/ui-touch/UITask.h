@@ -287,6 +287,8 @@ public:
   bool getThreadInfo(int idx, bool& channel, uint16_t& unread, uint32_t& ts, char* name, size_t name_len) const;
   int  getActiveThreadMessageCount(int out_indexes[], int max_out, bool newest_first) const;
   bool getMessageByIndex(int msg_idx, UIMessage& out) const;
+  bool deleteMessageBySlot(int msg_idx);          // tombstone one ring slot (long-press Delete)
+  int  clearThreadHistory(int thread_idx);        // tombstone every message of a thread; returns count
   const char* getComposerBuffer() const { return _compose_buf; }
   bool isComposerMode() const { return _composer_mode; }
   int  getComposerCharIndex() const { return _composer_char_idx; }
