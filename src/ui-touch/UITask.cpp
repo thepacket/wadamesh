@@ -5528,6 +5528,31 @@ static void threadSheetRoomLoginCb(lv_event_t* e) {
 // "Reset path" (DM sheet) — wipes the cached return path for this chat's contact so
 // the next send re-floods, without the detour through the Contacts tab (wyvern.red
 // feedback; same action as the contact sheet's Reset path).
+// "Delete history" (chat/channel settings sheet): tombstone every message of the
+// thread after a confirm. The thread row itself stays (the channel stays joined,
+// the contact stays) — this only wipes the conversation content.
+static int s_hist_clear_thread = -1;
+static void histClearApply() {
+  if (!g_lv.task || s_hist_clear_thread < 0) return;
+  const int idx = s_hist_clear_thread;
+  s_hist_clear_thread = -1;
+  const int cleared = g_lv.task->clearThreadHistory(idx);
+  refreshThreadLists();
+  if (g_lv.dm.detail_open) refreshChatDetailAsync(g_lv.dm);
+  if (g_lv.ch.detail_open) refreshChatDetailAsync(g_lv.ch);
+  char msg[40];
+  snprintf(msg, sizeof msg, TR("Deleted %d messages"), cleared);
+  g_lv.task->showAlert(msg, 1400);
+}
+static void threadSheetClearHistCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED || !g_lv.task) return;
+  const int idx = s_channel_long_idx;
+  closeChannelLongSheet();
+  s_hist_clear_thread = idx;
+  showConfirm(TR("Delete this chat's entire history?\nThe chat itself stays."),
+              TR("Delete"), histClearApply);
+}
+
 static void threadSheetResetPathCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED || !g_lv.task) return;
   const int idx = s_channel_long_idx;
@@ -5718,12 +5743,14 @@ static void openThreadActionSheet(int thread_idx, const char* name, bool is_chan
     // Chat-list avatar emoji: tap = pick, long-press = back to the two-letter auto avatar.
     lv_obj_t* icb = mk(LV_SYMBOL_IMAGE "  Chat icon", threadSheetIconCb, 0);
     if (icb) lv_obj_add_event_cb(icb, threadSheetIconResetCb, LV_EVENT_LONG_PRESSED, nullptr);
+    mk(LV_SYMBOL_TRASH    "  Delete history", threadSheetClearHistCb,    0);
     mk_full(LV_SYMBOL_TRASH "  Remove channel", channelLongSheetDeleteCb, 0xB23A48);
   } else {
     if (is_room_thread)
       mk(LV_SYMBOL_REFRESH "  Log in again",  threadSheetRoomLoginCb,    0);
     mk(LV_SYMBOL_LOOP     "  Reset path",     threadSheetResetPathCb,    0);
     mk(LV_SYMBOL_CLOSE    "  Blocked users",  channelLongSheetBlockedCb, 0);
+    mk(LV_SYMBOL_TRASH    "  Delete history", threadSheetClearHistCb,    0);
     mk_full(LV_SYMBOL_TRASH "  Delete chat",   threadSheetDeleteDmCb,     0xB23A48);
   }
 }
@@ -23924,8 +23951,22 @@ static void chatVirtSyncBubblePositions(LvChatPanel* p);
 static void chatVirtOnScrollEnd(LvChatPanel* p);
 static void chatVirtRemap1To1Scroll(LvChatPanel* p);
 static bool chatVirtAwayFromBottom(LvChatPanel* p);
+// Jump-arrow fade: fully visible while the list is scrolling, 50% one second
+// after the last scroll activity (UITask::loop does the dimming; every
+// chatUpdateJumpButtons call — which msgsScrollCb fires per scroll tick —
+// re-brightens and re-arms the timer). They stay tappable either way.
+static uint32_t s_jump_active_ms = 0;
+static bool     s_jump_dimmed    = false;
+static void jumpBtnsSetDim(LvChatPanel* p, bool dim) {
+  const lv_opa_t o = dim ? LV_OPA_50 : LV_OPA_COVER;
+  if (p->jump_oldest_btn) lv_obj_set_style_opa(p->jump_oldest_btn, o, LV_PART_MAIN);
+  if (p->jump_btn)        lv_obj_set_style_opa(p->jump_btn,        o, LV_PART_MAIN);
+  s_jump_dimmed = dim;
+}
 static void chatUpdateJumpButtons(LvChatPanel* p) {
   if (!p || !p->msgs) return;
+  s_jump_active_ms = millis();
+  if (s_jump_dimmed) jumpBtnsSetDim(p, false);
   if (p->jump_oldest_btn) {
     if (lv_obj_get_scroll_y(p->msgs) > 30) lv_obj_clear_flag(p->jump_oldest_btn, LV_OBJ_FLAG_HIDDEN);
     else lv_obj_add_flag(p->jump_oldest_btn, LV_OBJ_FLAG_HIDDEN);
@@ -24095,19 +24136,27 @@ static void makeChatDetail(LvChatPanel& p) {
   // ---- Jump buttons (Discord-style): floating circles, right edge, symmetric
   //      near the top/bottom of the message list. Hidden unless there is
   //      history beyond the viewport.
+  // Bare arrows, flush against the right edge — no button chrome. The 28x36
+  // transparent button keeps a usable touch target (plus ext_click_area) while
+  // only the glyph is visible; UITask::loop dims them to 50% one second after
+  // the last scroll (jumpBtnsSetDim above).
   p.jump_oldest_btn = lv_btn_create(p.overlay);
-  lv_obj_set_size(p.jump_oldest_btn, 40, 40);
-  lv_obj_set_style_radius(p.jump_oldest_btn, 20, LV_PART_MAIN);
-  lv_obj_set_style_bg_color(p.jump_oldest_btn, lv_color_hex(COLOR_ACCENT), LV_PART_MAIN);
-  lv_obj_set_style_bg_opa(p.jump_oldest_btn, LV_OPA_90, LV_PART_MAIN);
-  lv_obj_set_style_shadow_width(p.jump_oldest_btn, 6, LV_PART_MAIN);
-  lv_obj_set_style_shadow_opa(p.jump_oldest_btn, LV_OPA_40, LV_PART_MAIN);
-  lv_obj_set_pos(p.jump_oldest_btn, chatScreenW() - 50, CHAT_HDR_H + STATUSBAR_H + 2);
+  lv_obj_set_size(p.jump_oldest_btn, 28, 36);
+  lv_obj_set_style_bg_opa(p.jump_oldest_btn, LV_OPA_TRANSP, LV_PART_MAIN);
+  lv_obj_set_style_shadow_width(p.jump_oldest_btn, 0, LV_PART_MAIN);
+  lv_obj_set_style_border_width(p.jump_oldest_btn, 0, LV_PART_MAIN);
+  lv_obj_set_style_outline_width(p.jump_oldest_btn, 0, LV_PART_MAIN);
+  lv_obj_set_ext_click_area(p.jump_oldest_btn, 6);
+  lv_obj_set_pos(p.jump_oldest_btn, chatScreenW() - 28, CHAT_HDR_H + STATUSBAR_H + 2);
   lv_obj_t* jolbl = lv_label_create(p.jump_oldest_btn);
   lv_label_set_text(jolbl, LV_SYMBOL_UP);
-  lv_obj_set_style_text_color(jolbl, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+  lv_obj_set_style_text_font(jolbl, &g_font_16, LV_PART_MAIN);
+  lv_obj_set_style_text_color(jolbl, lv_color_hex(COLOR_ACCENT), LV_PART_MAIN);
   lv_obj_center(jolbl);
 #if defined(HAS_TANMATSU)
+  // Purple F-key chip (matches the hardware key hints) — keep its own geometry.
+  lv_obj_set_size(p.jump_oldest_btn, 40, 40);
+  lv_obj_set_pos(p.jump_oldest_btn, chatScreenW() - 42, CHAT_HDR_H + STATUSBAR_H + 2);
   styleChipAsFkey(p.jump_oldest_btn, jolbl, 4, 0xC724B1, 40, true);
   lv_obj_set_style_bg_color(p.jump_oldest_btn, lv_color_hex(0x101113), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(p.jump_oldest_btn, LV_OPA_70, LV_PART_MAIN);
@@ -24117,20 +24166,23 @@ static void makeChatDetail(LvChatPanel& p) {
   lv_obj_add_flag(p.jump_oldest_btn, LV_OBJ_FLAG_HIDDEN);
 
   p.jump_btn = lv_btn_create(p.overlay);
-  lv_obj_set_size(p.jump_btn, 40, 40);
-  lv_obj_set_style_radius(p.jump_btn, 20, LV_PART_MAIN);
-  lv_obj_set_style_bg_color(p.jump_btn, lv_color_hex(COLOR_ACCENT), LV_PART_MAIN);
-  lv_obj_set_style_bg_opa(p.jump_btn, LV_OPA_90, LV_PART_MAIN);
-  lv_obj_set_style_shadow_width(p.jump_btn, 6, LV_PART_MAIN);
-  lv_obj_set_style_shadow_opa(p.jump_btn, LV_OPA_40, LV_PART_MAIN);
-  lv_obj_set_pos(p.jump_btn, chatScreenW() - 50, chatCompYOpen() - 50);
+  lv_obj_set_size(p.jump_btn, 28, 36);
+  lv_obj_set_style_bg_opa(p.jump_btn, LV_OPA_TRANSP, LV_PART_MAIN);
+  lv_obj_set_style_shadow_width(p.jump_btn, 0, LV_PART_MAIN);
+  lv_obj_set_style_border_width(p.jump_btn, 0, LV_PART_MAIN);
+  lv_obj_set_style_outline_width(p.jump_btn, 0, LV_PART_MAIN);
+  lv_obj_set_ext_click_area(p.jump_btn, 6);
+  lv_obj_set_pos(p.jump_btn, chatScreenW() - 28, chatCompYOpen() - 40);
   lv_obj_t* jlbl = lv_label_create(p.jump_btn);
   lv_label_set_text(jlbl, LV_SYMBOL_DOWN);
-  lv_obj_set_style_text_color(jlbl, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+  lv_obj_set_style_text_font(jlbl, &g_font_16, LV_PART_MAIN);
+  lv_obj_set_style_text_color(jlbl, lv_color_hex(COLOR_ACCENT), LV_PART_MAIN);
   lv_obj_center(jlbl);
 #if defined(HAS_TANMATSU)
   // Purple ⏢ trapeze (matches the F6 hardware key). Keep a subtle dark backing so the
   // outline + arrow stay legible while it floats over the message bubbles.
+  lv_obj_set_size(p.jump_btn, 40, 40);
+  lv_obj_set_pos(p.jump_btn, chatScreenW() - 42, chatCompYOpen() - 50);
   styleChipAsFkey(p.jump_btn, jlbl, 4, 0xC724B1, 40, true);   // ◇ — same shape as the menubar's purple key
   lv_obj_set_style_bg_color(p.jump_btn, lv_color_hex(0x101113), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(p.jump_btn, LV_OPA_70, LV_PART_MAIN);
@@ -25227,6 +25279,20 @@ static void msgMenuResendCb(lv_event_t* e) {
     g_lv.task->showAlert(TR("Resend failed"), 1400);
 }
 
+static void msgMenuDeleteCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED || !g_lv.task) return;
+  lv_indev_t* a = lv_indev_get_act();
+  if (a) lv_indev_wait_release(a);
+  const int idx = s_msg_menu_idx;
+  closeMsgActionMenu();
+  if (g_lv.task->deleteMessageBySlot(idx)) {
+    refreshThreadLists();
+    if (g_lv.dm.detail_open) refreshChatDetailAsync(g_lv.dm);
+    if (g_lv.ch.detail_open) refreshChatDetailAsync(g_lv.ch);
+    g_lv.task->showAlert(TR("Message deleted"), 1100);
+  }
+}
+
 // One-tap retry (wyvern.red): a FAILED outgoing message is single-tappable — a quick
 // confirm, then the same resend engine as the long-press menu's Resend. The text is
 // snapshotted at tap (the ring may rotate before the confirm lands).
@@ -25349,7 +25415,7 @@ static void openMessageActionMenu(int msg_idx) {
   // Header row reserves space for the close-X badge so it doesn't sit on a button.
   const int hdr_h  = 24;
 #endif
-  const int nbtn   = (can_ack ? 1 : 0) + (can_mention ? 1 : 0) + 2 /*Copy+Info*/ + (can_block ? 1 : 0) + (can_resend ? 1 : 0);
+  const int nbtn   = (can_ack ? 1 : 0) + (can_mention ? 1 : 0) + 3 /*Copy+Info+Delete*/ + (can_block ? 1 : 0) + (can_resend ? 1 : 0);
   int card_h = hdr_h + nbtn * btn_h + (nbtn - 1) * gap + 2 * pad;
   // Never exceed the visible area under the status bar; scroll if it ever would
   // (e.g. an even taller menu, or a shorter display). The close-X floats, so it
@@ -25403,6 +25469,7 @@ static void openMessageActionMenu(int msg_idx) {
   mk_btn(LV_SYMBOL_LIST "  Info", msgMenuInfoCb, by);
   if (can_block)  { by += btn_h + gap; mk_btn(LV_SYMBOL_CLOSE   "  Block",  msgMenuBlockCb,  by); }
   if (can_resend) { by += btn_h + gap; mk_btn(LV_SYMBOL_REFRESH "  Resend", msgMenuResendCb, by); }
+  by += btn_h + gap; mk_btn(LV_SYMBOL_TRASH "  Delete", msgMenuDeleteCb, by);
 }
 
 // "Trace route" from the message Info popup: run a full multi-hop trace to the
@@ -37704,6 +37771,43 @@ bool UITask::getMessageByIndex(int msg_idx, UIMessage& out) const {
   return true;
 }
 
+// Delete = TOMBSTONE, not compaction: blanking the thread tag makes every walker
+// (getThreadMessageIndexes, previews, the virt layout) skip the slot, while the
+// physical ring indexes that live UI widgets and s_chat_msg_idx hold stay valid.
+// The slot ages out of the ring naturally.
+bool UITask::deleteMessageBySlot(int msg_idx) {
+  if (msg_idx < 0 || msg_idx >= _ui_msg_cap) return false;
+  UIMessage& m = _ui_msgs[msg_idx];
+  if (!m.thread[0]) return false;                // free or already tombstoned
+  m.thread[0] = '\0';
+  m.text[0]   = '\0';
+  m.sender[0] = '\0';
+  _msgs_dirty = true;
+  return true;
+}
+
+int UITask::clearThreadHistory(int thread_idx) {
+  if (thread_idx < 0 || thread_idx >= MAX_UI_THREADS || !_ui_threads[thread_idx].used) return 0;
+  int cleared = 0;
+  for (int i = 0; i < _ui_msg_count; ++i) {
+    const int idx = (_ui_msg_head - 1 - i + _ui_msg_cap) % _ui_msg_cap;
+    UIMessage& m = _ui_msgs[idx];
+    if (m.thread[0] &&
+        strncmp(m.thread, _ui_threads[thread_idx].name, MAX_THREAD_NAME) == 0 &&
+        m.channel == _ui_threads[thread_idx].channel) {
+      m.thread[0] = '\0';
+      m.text[0]   = '\0';
+      m.sender[0] = '\0';
+      ++cleared;
+    }
+  }
+  _ui_threads[thread_idx].unread      = 0;
+  _ui_threads[thread_idx].has_mention = false;
+  _threads_dirty = true;
+  if (cleared) _msgs_dirty = true;
+  return cleared;
+}
+
 int UITask::getUnreadMentionCount() const {
   int c = 0;
   for (int i = 0; i < MAX_UI_THREADS; i++)
@@ -39014,6 +39118,14 @@ void UITask::loop() {
     if (g_lv.dm.detail_open) refreshChatDetailAsync(g_lv.dm);
     if (g_lv.ch.detail_open) refreshChatDetailAsync(g_lv.ch);
     g_lv.dirty_timeline = false;
+  }
+  // Jump arrows dim to 50% one second after the last scroll activity (every
+  // scroll tick re-brightens them via chatUpdateJumpButtons).
+  if (!s_jump_dimmed && s_jump_active_ms &&
+      (uint32_t)(millis() - s_jump_active_ms) > 1000) {
+    if (g_lv.dm.detail_open)      jumpBtnsSetDim(&g_lv.dm, true);
+    else if (g_lv.ch.detail_open) jumpBtnsSetDim(&g_lv.ch, true);
+    else                          s_jump_dimmed = true;   // nothing open: park the state
   }
 #if CAP_SD
   // microSD insert/remove detection — only while the file manager is open, so
