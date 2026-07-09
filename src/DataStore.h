@@ -43,6 +43,12 @@ public:
   // if the dir can't be created. No-op on non-ESP32.
   bool useSdStorage();
 #endif
+#if defined(HAS_TANMATSU)
+  // Full-store adoption of the SD_MMC card (Tanmatsu): identity + prefs move off
+  // the broken-metadata internal FFat (its exists()/f_stat lie, which made the
+  // gated loads come up empty). Caller migrates FFat-resident files first.
+  bool useSdMmcStorage();
+#endif
   FILESYSTEM* getPrimaryFS() const { return _fs; }
   FILESYSTEM* getSecondaryFS() const { return _fsExtra; }
   // Route contacts + channels (see _getContactsChannelsFS) to a different FS than identity/prefs.
