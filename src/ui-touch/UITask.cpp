@@ -25399,24 +25399,27 @@ static void openMessageActionMenu(int msg_idx) {
   lv_obj_clear_flag(s_msg_menu_root, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_event_cb(s_msg_menu_root, msgMenuBackdropCb, LV_EVENT_CLICKED, nullptr);
 
-  // The 800×480 Tanmatsu dwarfs this 180-wide menu, so widen it and grow the
-  // rows; the smaller boards keep the historical integers (PSC is a no-op there).
+  // The 800×480 Tanmatsu dwarfs this menu, so widen it and grow the rows; the
+  // smaller boards keep plain integers (PSC is a no-op there). Buttons sit TWO
+  // per row — with Delete the menu carries up to 7 actions, and a single column
+  // no longer fit the 240-px screens without scrolling.
 #if CAP_LARGE_SCREEN
-  const int card_w = PSC(180);
+  const int card_w = PSC(220);
   const int btn_h  = PSC(30);
   const int gap    = PSC(4);
   const int pad    = PSC(10);
   const int hdr_h  = PSC(24);
 #else
-  const int card_w = 180;
-  const int btn_h  = 30;   // was 38 — the menu now carries up to 5 rows (Ack/Mention/Copy/Info/Block); shrink so they fit a 240-px screen
+  const int card_w = 200;
+  const int btn_h  = 30;
   const int gap    = 4;
   const int pad    = 10;
   // Header row reserves space for the close-X badge so it doesn't sit on a button.
   const int hdr_h  = 24;
 #endif
   const int nbtn   = (can_ack ? 1 : 0) + (can_mention ? 1 : 0) + 3 /*Copy+Info+Delete*/ + (can_block ? 1 : 0) + (can_resend ? 1 : 0);
-  int card_h = hdr_h + nbtn * btn_h + (nbtn - 1) * gap + 2 * pad;
+  const int nrows  = (nbtn + 1) / 2;
+  int card_h = hdr_h + nrows * btn_h + (nrows - 1) * gap + 2 * pad;
   // Never exceed the visible area under the status bar; scroll if it ever would
   // (e.g. an even taller menu, or a shorter display). The close-X floats, so it
   // stays pinned while the buttons scroll.
@@ -25442,10 +25445,14 @@ static void openMessageActionMenu(int msg_idx) {
   }
   addCloseXBadge(card, msgMenuBackdropCb);
 
-  auto mk_btn = [&](const char* text, lv_event_cb_t cb, int y_off) {
+  // Two buttons per row, filled in reading order; an odd last button gets its
+  // own row (left cell). bi advances per button; the grid math places it.
+  const int bw = (card_w - 2 * pad - gap) / 2;
+  int bi = 0;
+  auto mk_btn = [&](const char* text, lv_event_cb_t cb) {
     lv_obj_t* b = lv_btn_create(card);
-    lv_obj_set_size(b, card_w - 2 * pad, btn_h);
-    lv_obj_set_pos(b, 0, y_off);
+    lv_obj_set_size(b, bw, btn_h);
+    lv_obj_set_pos(b, (bi % 2) * (bw + gap), hdr_h + (bi / 2) * (btn_h + gap));
     styleButton(b);
     lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, nullptr);
     lv_obj_t* lbl = lv_label_create(b);
@@ -25453,23 +25460,19 @@ static void openMessageActionMenu(int msg_idx) {
     lv_obj_set_style_text_font(lbl, &g_font_14, LV_PART_MAIN);
     lv_obj_set_style_text_color(lbl, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
     lv_obj_center(lbl);
+    ++bi;
   };
-  int by = hdr_h;
-  if (can_ack) {
-    mk_btn(LV_SYMBOL_OK "  Ack", msgMenuAckCb, by);
-    by += btn_h + gap;
-  }
+  if (can_ack) mk_btn(LV_SYMBOL_OK "  Ack", msgMenuAckCb);
   if (can_mention) {
     char ml[UITask::MAX_SENDER_NAME + 16];
-    snprintf(ml, sizeof ml, "@%.16s", m.sender);   // "Mention" is implied by the @
-    mk_btn(ml, msgMenuMentionCb, by);
-    by += btn_h + gap;
+    snprintf(ml, sizeof ml, "@%.10s", m.sender);   // "Mention" is implied by the @; half-width cell
+    mk_btn(ml, msgMenuMentionCb);
   }
-  mk_btn(LV_SYMBOL_COPY "  Copy", msgMenuCopyCb, by);  by += btn_h + gap;
-  mk_btn(LV_SYMBOL_LIST "  Info", msgMenuInfoCb, by);
-  if (can_block)  { by += btn_h + gap; mk_btn(LV_SYMBOL_CLOSE   "  Block",  msgMenuBlockCb,  by); }
-  if (can_resend) { by += btn_h + gap; mk_btn(LV_SYMBOL_REFRESH "  Resend", msgMenuResendCb, by); }
-  by += btn_h + gap; mk_btn(LV_SYMBOL_TRASH "  Delete", msgMenuDeleteCb, by);
+  mk_btn(LV_SYMBOL_COPY "  Copy", msgMenuCopyCb);
+  mk_btn(LV_SYMBOL_LIST "  Info", msgMenuInfoCb);
+  if (can_block)  mk_btn(LV_SYMBOL_CLOSE   "  Block",  msgMenuBlockCb);
+  if (can_resend) mk_btn(LV_SYMBOL_REFRESH "  Resend", msgMenuResendCb);
+  mk_btn(LV_SYMBOL_TRASH "  Delete", msgMenuDeleteCb);
 }
 
 // "Trace route" from the message Info popup: run a full multi-hop trace to the
