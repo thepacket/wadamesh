@@ -9908,6 +9908,26 @@ static void kbBlPresetCb(lv_event_t* e) {          // Off / 25 / 50 / 75 / Max: 
 }
 #endif
 
+#if defined(HAS_PAGER_KEYBOARD)
+static lv_obj_t* s_pager_kbbl_lbl = nullptr;   // Settings->Keyboard row caption (modal is a singleton)
+
+static const char* pagerKbBlModeText() {
+  return s_kb_bl_mode == 0 ? "Off" : (s_kb_bl_mode == 1 ? "On" : "Auto");
+}
+
+// Cycle off -> on -> auto -> off and persist -- same semantics as the Control
+// Center's ccKbBacklightCb, duplicated rather than shared since CC is
+// unreachable on this board (no touch launcher to open it) and the two update
+// their UI differently (CC rebuilds the whole popup; this just relabels one
+// button).
+static void pagerKbBlCycleCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  s_kb_bl_mode = (uint8_t)((s_kb_bl_mode + 1) % 3);
+  touchPrefsSetKbBacklight(s_kb_bl_mode);
+  if (s_pager_kbbl_lbl) lv_label_set_text(s_pager_kbbl_lbl, pagerKbBlModeText());
+}
+#endif
+
 static void buildDeviceSettings(int sec) {
   // One detail page per section: each block below is gated to its DSEC_* section
   // (skipped blocks don't advance y, so every page lays out from the top).
@@ -10333,6 +10353,23 @@ static void buildDeviceSettings(int sec) {
       lv_obj_t* l = lv_label_create(b); lv_label_set_text(l, k_presets[i].txt); lv_obj_center(l);
     }
     y += SC(38);
+  }
+#elif defined(HAS_PAGER_KEYBOARD)
+  /* Keyboard backlight: off / on / auto (lit while typing, dark after ~3 s idle).
+     No brightness slider here (unlike the T-Deck) -- this board's backlight is a
+     simple on/off strip, so there's nothing to dial in beyond the mode. */
+  {
+    y += settingsRowLabel(body, y, 0, "Keyboard backlight", COLOR_SUB, &g_font_12, 0) + 4;
+    lv_obj_t* b = lv_btn_create(body);
+    lv_obj_set_size(b, lv_pct(100), SC(34));
+    lv_obj_set_pos(b, 2, y);
+    styleButton(b);
+    lv_obj_add_event_cb(b, pagerKbBlCycleCb, LV_EVENT_CLICKED, nullptr);
+    s_pager_kbbl_lbl = lv_label_create(b);
+    lv_label_set_text(s_pager_kbbl_lbl, pagerKbBlModeText());
+    lv_obj_center(s_pager_kbbl_lbl);
+    y += SC(42);
+    y += settingsRowLabel(body, y, 0, "tap to cycle off / on / auto", COLOR_SUB, &g_font_12, 0) + 2;
   }
 #endif
   /* Secondary keyboards (multi-select). Switch on any layouts you want in the
@@ -27353,6 +27390,22 @@ static void updatePagerBackspaceUnlockHold(unsigned long now) {
   }
   s_was_held = held;
 }
+
+// Keyboard backlight: off/on/auto (s_kb_bl_mode, shared with every CAP_KEYBOARD
+// board) applied to the physical GPIO46 LEDC PWM. Unlike the T-Deck's slider,
+// this board has no brightness curve to honour -- the backlight is a simple
+// full-on/off strip under the keys, so "on" is just max PWM duty (255). Runs
+// UNCONDITIONALLY, even while the screen is off/locked -- forcing it dark in
+// that state is exactly its job here, so (unlike updatePagerBackspaceHold,
+// which must NOT act while off) it can't be skipped the same way.
+static void updatePagerKbBacklight(unsigned long now) {
+  uint8_t kb_bl = 0;
+  if (s_kb_bl_mode == 1) kb_bl = 255;
+  else if (s_kb_bl_mode == 2 && (now - s_kb_last_key_ms) < kKbBacklightIdleMs) kb_bl = 255;
+  if (g_lv.task && (g_lv.task->isScreenOff() || g_lv.task->isManualLock())) kb_bl = 0;
+  static uint8_t s_last = 0xFF;   // only hit the LEDC write when the value actually changes
+  if (kb_bl != s_last) { s_last = kb_bl; pagerKeyboardSetBacklight(kb_bl); }
+}
 #endif
 
 #if defined(HAS_PAGER_ENCODER)
@@ -27391,6 +27444,7 @@ static void updatePagerEncoder(unsigned long now) {
   // rotary navigation (nothing else on this board resets it; see handleHwKey()'s
   // matching TLORA_PAGER fix) and the screen dimmed mid-use.
   if ((delta != 0 || held) && g_lv.task) g_lv.task->noteUserInput();
+  if (delta != 0 || held) noteKbActivity();   // same activity counts for the keyboard-backlight auto mode
 
   // Alt+turn is a modifier combo, not a solo Alt tap -- mark it used so a
   // release right after this doesn't ALSO fire updatePagerAltTapNext()'s NEXT.
@@ -28619,6 +28673,7 @@ static void handleHwKey(int key) {
   // no-op'd here and the idle timer kept counting down while the user was actively
   // pressing keys (reported bug: screen dims after ~30s despite keyboard input).
   if (g_lv.task) g_lv.task->noteUserInput();
+  noteKbActivity();   // any key counts as activity for the keyboard-backlight auto mode too
 #endif
 #if CAP_TRACKBALL
   // Remapping a tab hotkey (Settings → Keyboard): capture the next key press.
@@ -38151,16 +38206,18 @@ void UITask::loop() {
   serviceLockscreen();            // refresh the lock-screen clock on minute roll-over
   serviceLockingCountdown(now);   // advance / fire the spacebar "Locking…" countdown
 #elif defined(HAS_PAGER_KEYBOARD)
-  // Simpler than the T-Deck's: no keyboard-backlight-mode timer wiring yet
-  // (pagerKeyboardSetBacklight() exists but isn't hooked up here). No separate
-  // core-0 touch task to own the I2C bus either (no touch at all), so poll and
-  // drain right here, once per tick. Space press-and-hold locks the screen
+  // No separate core-0 touch task to own the I2C bus (no touch at all), so poll
+  // and drain right here, once per tick. Space press-and-hold locks the screen
   // (updatePagerSpaceHold); Backspace press-and-hold unlocks it again
   // (updatePagerBackspaceUnlockHold) -- the latter must run unconditionally,
   // BEFORE the isScreenOff() split below, since it has to keep working while
-  // the screen is dark.
+  // the screen is dark. updatePagerKbBacklight() is the same story -- it has
+  // to force the backlight dark the instant the screen goes off/locked, so it
+  // runs unconditionally too, rather than being skipped like the awake-only
+  // helpers in the else branch below.
   pagerKeyboardPoll();
   updatePagerBackspaceUnlockHold(now);
+  updatePagerKbBacklight(now);
   if (g_lv.task && g_lv.task->isScreenOff()) {
     // Same rationale as updatePagerEncoder(): no touch/trackball wake path on
     // this board, so a keypress while idle-dimmed just wakes the screen
