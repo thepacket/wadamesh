@@ -385,6 +385,33 @@ extern "C" const lv_font_t extras_lat_28;
 static lv_font_t g_font_12;
 static lv_font_t g_font_14;
 static lv_font_t g_font_16;
+
+// Auto-shrink a single-line label's font one baked step (16 -> 14 -> 12) until its
+// text fits within max_w, so a longer translation (French/German/Russian/…) fits a
+// fixed-width button or cell instead of clipping. No-op if it already fits or is
+// already at 12 px. Cheap (one lv_txt_get_size per candidate) — call once, right
+// after setting the label's text + font. Fonts scale on the Tanmatsu, so the ladder
+// stays proportional there too. Wrapping/marquee is intentionally NOT used here —
+// this keeps one-line button labels one line.
+static void uiFitLabelWidth(lv_obj_t* lbl, lv_coord_t max_w) {
+  if (!lbl || max_w <= 6) return;
+  const char* txt = lv_label_get_text(lbl);
+  if (!txt || !txt[0]) return;
+  const lv_font_t* cur = lv_obj_get_style_text_font(lbl, LV_PART_MAIN);
+  lv_point_t sz;
+  // Already fits at the current font? Do nothing. Measuring the CURRENT font first
+  // (not assuming it's one of ours) means this never shrinks a label that fits — so
+  // it's safe to call on any label, whatever font it inherited.
+  lv_txt_get_size(&sz, txt, cur, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+  if (sz.x <= max_w) return;
+  // Overflows: pick the LARGEST baked font (16 -> 14 -> 12) that fits.
+  const lv_font_t* ladder[3] = { &g_font_16, &g_font_14, &g_font_12 };
+  for (int i = 0; i < 3; ++i) {
+    lv_txt_get_size(&sz, txt, ladder[i], 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+    if (sz.x <= max_w) { lv_obj_set_style_text_font(lbl, ladder[i], LV_PART_MAIN); return; }
+  }
+  lv_obj_set_style_text_font(lbl, &g_font_12, LV_PART_MAIN);   // still wide: 12 px beats clipping a bigger font
+}
 #if LV_USE_IMGFONT
 // lv_imgfont path callback: hand back the baked colour image for an emoji
 // codepoint (copied into the imgfont's scratch buffer as an lv_img_dsc_t), or
@@ -11122,6 +11149,7 @@ static void showConfirm(const char* msg, const char* ok_label, SimpleCb on_confi
   lv_obj_add_event_cb(b_cancel, confirmCancelEvt, LV_EVENT_CLICKED, nullptr);
   lv_obj_t* lc = lv_label_create(b_cancel);
   lv_label_set_text(lc, TR("Cancel"));
+  uiFitLabelWidth(lc, PSC(80) - 8);
   lv_obj_center(lc);
 
   lv_obj_t* b_ok = lv_btn_create(card);
@@ -11131,6 +11159,7 @@ static void showConfirm(const char* msg, const char* ok_label, SimpleCb on_confi
   lv_obj_add_event_cb(b_ok, confirmOkEvt, LV_EVENT_CLICKED, nullptr);
   lv_obj_t* lo = lv_label_create(b_ok);
   lv_label_set_text(lo, ok_label ? TR(ok_label) : "OK");
+  uiFitLabelWidth(lo, SC(100) - 8);
   lv_obj_center(lo);
 }
 
@@ -19235,7 +19264,10 @@ static void makeHome(lv_obj_t* tab) {
     lv_obj_set_style_bg_opa(hint, LV_OPA_70, LV_PART_MAIN);
     lv_obj_set_style_pad_hor(hint, 3, LV_PART_MAIN);
     lv_obj_set_style_radius(hint, 3, LV_PART_MAIN);
-    lv_obj_align(hint, LV_ALIGN_TOP_RIGHT, -2, 2);
+    // Bottom-right (per the design note above), opposite corner from the top-left
+    // "Sig --" chip — so a longer translation ("touchez pour les détails") no longer
+    // overlaps it. (It was TOP_RIGHT, which only cleared "Sig" for the short EN text.)
+    lv_obj_align(hint, LV_ALIGN_BOTTOM_RIGHT, -2, -2);
   }
 
 #if CAP_LARGE_SCREEN
@@ -25533,6 +25565,7 @@ static void openMessageActionMenu(int msg_idx) {
     lv_label_set_text(lbl, TR(text));
     lv_obj_set_style_text_font(lbl, &g_font_14, LV_PART_MAIN);
     lv_obj_set_style_text_color(lbl, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+    uiFitLabelWidth(lbl, bw - 8);   // shrink a long translation (e.g. FR "Supprimer") to fit the fixed-width button
     lv_obj_center(lbl);
     ++bi;
   };
@@ -30655,6 +30688,7 @@ static void powerOffCb(lv_event_t* e) {
   if (g_lv.task) {
     g_lv.task->persistHistoryNow();        // flush chat before we go down
     discoveredFlushNow();                  // and the Discovered ring
+    the_mesh.flushContactsIfDirty();       // and any coalesced contacts refresh
     g_lv.task->showAlert(TR("Powering off\xE2\x80\xA6 click trackball to wake"), 1500);
   }
   // Let the toast paint, then enter deep sleep.
@@ -31644,11 +31678,16 @@ static void addAppTile(lv_obj_t* parent, int x, int y, int w, int h,
   // Label UNDER the chip.
   lv_obj_t* lb = lv_label_create(t);
   lv_label_set_text(lb, TR(label));
-  lv_obj_set_width(lb, w);
-  lv_label_set_long_mode(lb, LV_LABEL_LONG_DOT);        // ellipsize if too wide
   lv_obj_set_style_text_align(lb, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
   lv_obj_set_style_text_font(lb, big ? &g_font_14 : &g_font_12, LV_PART_MAIN);
   lv_obj_set_style_text_color(lb, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+  // A long app title (often longer once translated) shrinks to fit ONE line rather
+  // than wrapping to two: fit the font to the tile width, then pin the label to a
+  // single line height so LONG_DOT can only ellipsize on that one line, never wrap.
+  uiFitLabelWidth(lb, w - 2);
+  lv_obj_set_width(lb, w);
+  lv_label_set_long_mode(lb, LV_LABEL_LONG_DOT);
+  lv_obj_set_height(lb, lv_font_get_line_height(lv_obj_get_style_text_font(lb, LV_PART_MAIN)));
   lv_obj_align(lb, LV_ALIGN_BOTTOM_MID, 0, -2);
 
   // Notification badge: a small red count pill in the top-right corner.
@@ -38726,6 +38765,7 @@ void UITask::rebootDevice() {
   if (_threads_dirty) saveThreadsToStorage();
   if (_msgs_dirty) saveMsgsToStorage();
   discoveredFlushNow();   // persist the Discovered ring before we go down
+  the_mesh.flushContactsIfDirty();   // and any coalesced contacts refresh (card-less devices)
   if (_board) _board->reboot();
 }
 

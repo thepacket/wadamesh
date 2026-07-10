@@ -1,0 +1,7 @@
+# beta_40 (TEST) - V4 freeze fix + long-text auto-fit. On top of beta_39.
+# One user-facing note per non-blank, non-# line; # lines are section comments.
+
+# --- Fixed ---
+Heltec V4 (and any device without an SD card) no longer freezes for several seconds at a time. The contacts file was being rewritten to internal flash every time a known node re-advertised, and that write can trigger a slow flash cleanup that stalls the whole device. Those refreshes are now batched, so the file is rewritten far less often; a genuinely new or removed contact still saves right away.
+Long text in other languages no longer overlaps or gets cut off. Oversized labels now shrink to fit on one line instead of clipping or wrapping: in the message long-press menu (French "Supprimer" was being cut to "Supprime"), the confirmation dialogs, and the app-drawer tiles.
+On the home signal graph, the "tap for details" hint no longer overlaps the signal readout in longer languages; it sits in the bottom-right corner now.

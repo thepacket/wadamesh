@@ -76,6 +76,14 @@ public:
   bool removeFile(FILESYSTEM* fs, const char* filename);
   uint32_t getStorageUsedKb() const;
   uint32_t getStorageTotalKb() const;
+#if defined(ESP32)
+  // True while contacts/channels live on the internal flash FS (SPIFFS/LittleFS),
+  // whose garbage collection makes a full rewrite expensive — a multi-second GC
+  // pass that freezes the loop. False once routed to an SD card (useSdStorage sets
+  // _root; setSecondaryFS sets _fsExtra) — FAT has no such GC. Lets callers coalesce
+  // the advert-driven contacts save on card-less devices without changing SD boards.
+  bool contactsOnInternalFlash() const { return _root[0] == '\0' && _fsExtra == nullptr; }
+#endif
 
 private:
   FILESYSTEM* _getContactsChannelsFS() const { if (_fsExtra) return _fsExtra; return _fs;};

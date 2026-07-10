@@ -137,6 +137,11 @@ static int s_companion_ota_pinned_reply_target = -1;
 #define DIRECT_SEND_PERHOP_FACTOR       6.0f
 #define DIRECT_SEND_PERHOP_EXTRA_MILLIS 250
 #define LAZY_CONTACTS_WRITE_DELAY       5000
+// On card-less (internal-flash) devices, coalesce advert-refresh contacts saves to
+// at most once per this window — a full rewrite can trigger a multi-second SPIFFS GC
+// that freezes the loop, and re-adverts (last-heard/path refreshes) otherwise churn
+// it constantly. A change in the contact SET still saves promptly (see MyMesh::loop).
+#define CONTACTS_REFRESH_SAVE_INTERVAL  300000
 // Our self-chosen room-session keep-alive interval (secs). Room servers zero the
 // legacy suggested-interval field in LOGIN_OK, so the client picks. 128 is the
 // value upstream itself recommended while the field was live (CLIENT_KEEP_ALIVE_SECS
@@ -4015,6 +4020,11 @@ static bool save_filter(const ContactInfo& c) {
 
 void MyMesh::saveContacts() {
   _store->saveContacts(this, save_filter);
+  // Keep the advert-save coalescer (MyMesh::loop) in sync on EVERY save path —
+  // lazy flush, app command, reboot — so the next lazy check compares against the
+  // freshly-written contact set + resets the refresh window.
+  _last_saved_contacts_n = getNumContacts();
+  _next_contacts_refresh_save = futureMillis(CONTACTS_REFRESH_SAVE_INTERVAL);
 }
 
 void MyMesh::enterCLIRescue() {
@@ -4461,10 +4471,29 @@ void MyMesh::loop() {
     checkSerialInterface();
   }
 
-  // is there are pending dirty contacts write needed?
+  // Pending contacts write. On card-less devices the contacts file lives on internal
+  // flash (SPIFFS/LittleFS), where a full rewrite can trigger a multi-second GC pass
+  // that freezes the whole loop (About "Loop stalls" showed ~18 s on a V4). Adverts
+  // refresh existing contacts constantly, so persisting every refresh churns the
+  // flash. Save promptly when the contact SET changed (a new/removed node MUST
+  // survive a reboot), but coalesce pure refreshes (last-heard time, path, name/GPS
+  // of a known node — all self-healing, and a clean reboot flushes them via
+  // CMD_REBOOT) to CONTACTS_REFRESH_SAVE_INTERVAL. SD-routed boards (FAT, no GC) are
+  // unaffected — contactsOnInternalFlash() is false there, so they always save.
   if (dirty_contacts_expiry && millisHasNowPassed(dirty_contacts_expiry)) {
-    saveContacts();
-    dirty_contacts_expiry = 0;
+    bool defer = false;
+#if defined(ESP32)
+    if (getNumContacts() == _last_saved_contacts_n && _store->contactsOnInternalFlash()
+        && !millisHasNowPassed(_next_contacts_refresh_save)) {
+      defer = true;   // no add/remove + still inside the refresh window on GC-prone flash
+    }
+#endif
+    if (defer) {
+      dirty_contacts_expiry = futureMillis(LAZY_CONTACTS_WRITE_DELAY);   // re-check soon; don't rewrite yet
+    } else {
+      saveContacts();                 // updates _last_saved_contacts_n + _next_contacts_refresh_save
+      dirty_contacts_expiry = 0;
+    }
   }
 
 #if defined(ENABLE_ADVERT_ON_BOOT) && ENABLE_ADVERT_ON_BOOT == 1
