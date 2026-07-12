@@ -33332,6 +33332,7 @@ static void docCaptureTour() {
   navGoToMainTab(HOME_TAB_INDEX); docSettle(3);
   openMonitorPage();  docSettle(14); captureScreenToSerial("app_rfmonitor"); closeMonitorPage();  docSettle(6);
   openSpectrumPage(); docSettle(14); captureScreenToSerial("app_spectrum");  closeSpectrumPage(); docSettle(6);
+  openRemotePage();   docSettle(14); captureScreenToSerial("app_remote");    closeRemotePage();   docSettle(6);
 
   Serial.print("\n<<<WMTOUR END>>>\n"); Serial.flush();
 }
