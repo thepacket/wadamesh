@@ -55,6 +55,21 @@ bool radio_init() {
   // unnecessary, and it's one less thing to keep in sync if the boot order
   // ever changes.
 
+#if defined(USE_SX1262)
+  // SX1262 variant of this board (Milestone 10 — same NSS/RESET/BUSY/DIO1
+  // pins as the LR1121 branch below; same PCB slot, different chip
+  // populated). CustomSX1262::std_init() is the exact same generic init the
+  // T-Deck already uses — reused as-is rather than hand-rolling a second
+  // manual sequence, since it already does everything the LR1121 branch
+  // below does by hand (begin() with freq/bw/sf/cr/power, setCRC(1),
+  // RF-switch config) driven entirely by this env's build flags (see
+  // platformio.ini's SX126X_* comments for why each one is/isn't set).
+  // nullptr here, not the shared SPIClass: the Module above was already
+  // constructed with it, so std_init()'s own spi->begin() would just be a
+  // harmless-but-unnecessary re-attach — same reasoning as the "No spi.begin()
+  // here" comment above.
+  return radio.std_init(nullptr);
+#else
 #ifdef LORA_CR
   uint8_t cr = LORA_CR;
 #else
@@ -103,6 +118,7 @@ bool radio_init() {
   radio.setCRC(1);
 
   return true;
+#endif
 }
 
 mesh::LocalIdentity radio_new_identity() {
