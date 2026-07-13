@@ -145,3 +145,15 @@
 #else
   #define CAP_COMPANION 0
 #endif
+
+// ---- On-device web browser (the "Web" reader app) ---------------------------
+// The reader fetches pages over on-device HTTPS, and a TLS handshake needs ~30 KB of
+// free INTERNAL heap. Only the 8 MB-PSRAM boards (T-Deck, Tanmatsu, ThinkNode M9, RAK
+// Tap) have that headroom; the 2 MB Heltec V4 TFT can't complete the handshake
+// (fetch returns -1), so the Web app is gated out there. Tapping a link in chat still
+// offers "Create QR" everywhere — only "Open in web" is gated to these boards.
+#if defined(HELTEC_LORA_V4_TFT)
+  #define CAP_WEB_BROWSER 0
+#else
+  #define CAP_WEB_BROWSER 1
+#endif

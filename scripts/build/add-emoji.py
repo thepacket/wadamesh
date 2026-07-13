@@ -36,6 +36,7 @@ SINGLE = [
     (0x1F4F7, "1f4f7"),   # camera
     (0x1F4F1, "1f4f1"),   # mobile phone
     (0x1F4BB, "1f4bb"),   # laptop
+    (0x1F310, "1f310"),   # globe with meridians (Web app icon)
     (0x1F4C5, "1f4c5"),   # calendar
     (0x1F4E1, "1f4e1"),   # satellite antenna
     (0x1F4E7, "1f4e7"),   # e-mail

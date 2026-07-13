@@ -125,6 +125,7 @@
     #if defined(MULTI_TRANSPORT_COMPANION)
       #include <WiFi.h>
       #include <HTTPClient.h>
+      #include <WiFiClientSecure.h>   // on-device HTTPS for the Reader (text browser); setInsecure(), no cert store
       #if CAP_OTA
         #include <Update.h>   // Arduino OTA writer (native dual-OTA boards; Tanmatsu is IDF/AppFS, no OTA)
       #endif
@@ -842,6 +843,12 @@ constexpr int SWIPE_SCROLL_STEP  = 90;
 // Runtime (not constexpr) so the UI-scale can grow it to fit bigger status-bar text — set to SC(22)
 // once at boot in begin(), before the UI is built. Stays 22 on the non-scaled boards.
 static lv_coord_t STATUSBAR_H = 22;
+// True while the Reader/Web page is collapsed and showing its URL in the status bar's
+// title zone — updateGlobalStatusBar then hides the clock to make room for the URL.
+static bool s_reader_bar_url = false;
+// True whenever the Reader/Web page is open — suppresses the tall status-bar glass
+// fade so the address reads on a solid bar (no gradient behind it).
+static bool s_reader_page_open = false;
 struct GlobalStatusBar {
   lv_obj_t* root;
   lv_obj_t* left_label;
@@ -19022,6 +19029,491 @@ static void monitorDismissCb(lv_event_t* e) {
   closeMonitorPage();
 }
 
+// ============================ Reader: on-device text browser =========================
+// A minimal browser that fetches a URL over HTTP/HTTPS ENTIRELY ON THE DEVICE (no
+// proxy), strips the HTML to plain text, and shows it scrollable. HTTPS uses
+// setInsecure() — no cert store, no validation: this is a text reader, not a secure
+// client (the ask: an "apocalyptic" browser — on-device only, nothing leaves the
+// device to a third party). No JS / CSS / images by design. All network + parse work
+// runs on a core-0 worker task so LVGL never blocks; the UI loop polls s_reader_dirty.
+#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+static const char    kReaderDefaultUrl[] = "wadamesh.com";
+static lv_obj_t*     s_reader_root   = nullptr;
+static lv_obj_t*     s_reader_url_ta = nullptr;
+static lv_obj_t*     s_reader_go     = nullptr;
+static lv_obj_t*     s_reader_editbtn= nullptr;    // floating "edit URL" button (shown while reading)
+static lv_obj_t*     s_reader_scroll = nullptr;    // flex-column body container (holds text + link labels)
+static lv_obj_t*     s_reader_status = nullptr;    // status / error line
+static char          s_reader_url[300] = "";       // the URL being (or last) fetched
+static char*         s_reader_text   = nullptr;    // PSRAM: extracted text (NUL-terminated)
+static volatile bool s_reader_dirty  = false;      // worker -> UI: text/status changed
+static volatile bool s_reader_busy   = false;      // a fetch is in flight
+static volatile bool s_reader_ok     = false;      // last fetch produced a page (worker -> UI)
+static char          s_reader_msg[110] = "";       // status text (worker writes, UI shows)
+static TaskHandle_t  s_reader_task    = nullptr;
+static bool          s_reader_pristine = false;    // URL field still holds the untouched default
+static const size_t  kReaderRawCap  = 192 * 1024;  // max raw HTML we buffer (PSRAM)
+static const size_t  kReaderTextCap =  60 * 1024;  // max extracted text we keep
+// Links found on the page: byte range in s_reader_text + resolved absolute href.
+struct ReaderLink { uint32_t start, end; char href[240]; };
+static const int     kReaderMaxLinks = 280;
+static ReaderLink*   s_reader_links   = nullptr;   // PSRAM array, lazily allocated
+static int           s_reader_nlinks  = 0;
+// Navigation history (back / forward). A simple bounded stack in PSRAM: s_reader_hist_pos
+// is the current entry; back/forward walk it, a new navigation truncates any forward tail.
+static const int     kReaderHistMax   = 24;
+static char        (*s_reader_hist)[300] = nullptr;   // PSRAM [kReaderHistMax][300]
+static int           s_reader_hist_n   = 0;           // entries in use
+static int           s_reader_hist_pos = -1;          // current index (-1 = none yet)
+static lv_obj_t*     s_reader_navbar   = nullptr;      // bottom toolbar
+static lv_obj_t*     s_reader_back     = nullptr;
+static lv_obj_t*     s_reader_fwd      = nullptr;
+
+static void closeReaderPage();
+static void readerNavigate(const char* in, bool push);
+static void readerUpdateNavButtons();
+static void readerRenderBody();
+static void readerSetAddrExpanded(bool exp);
+static void readerShowLoading();
+
+// case-insensitive prefix test
+static bool readerCiPrefix(const char* s, size_t n, const char* pfx) {
+  size_t ln = strlen(pfx); if (n < ln) return false;
+  for (size_t i = 0; i < ln; i++) { char a = s[i], b = pfx[i];
+    if (a >= 'A' && a <= 'Z') a += 32; if (b >= 'A' && b <= 'Z') b += 32; if (a != b) return false; }
+  return true;
+}
+// Decode one HTML entity at s[0]=='&'. Writes UTF-8 to out (>=4 bytes), sets *wrote,
+// returns consumed input length; 0 if unrecognised (caller emits '&' literally).
+static size_t readerEntity(const char* s, size_t n, char* out, int* wrote) {
+  static const struct { const char* name; const char* utf8; } named[] = {
+    {"amp;","&"},{"lt;","<"},{"gt;",">"},{"quot;","\""},{"apos;","'"},{"nbsp;"," "},
+    {"mdash;","\xe2\x80\x94"},{"ndash;","\xe2\x80\x93"},{"hellip;","\xe2\x80\xa6"},
+    {"lsquo;","\xe2\x80\x98"},{"rsquo;","\xe2\x80\x99"},{"ldquo;","\xe2\x80\x9c"},
+    {"rdquo;","\xe2\x80\x9d"},{"copy;","\xc2\xa9"},{"reg;","\xc2\xae"},{"euro;","\xe2\x82\xac"},
+    {"deg;","\xc2\xb0"},{"middot;","\xc2\xb7"},{"bull;","\xe2\x80\xa2"},{"trade;","\xe2\x84\xa2"},
+  };
+  for (auto& e : named) { size_t ln = strlen(e.name);
+    if (n > ln && strncmp(s + 1, e.name, ln) == 0) { int w = strlen(e.utf8); memcpy(out, e.utf8, w); *wrote = w; return ln + 1; } }
+  if (n > 3 && s[1] == '#') {                            // &#NNN; or &#xHH;
+    long cp = 0; bool hex = (s[2] == 'x' || s[2] == 'X'); size_t i = hex ? 3 : 2, start = i;
+    for (; i < n && s[i] != ';'; i++) { char c = s[i]; int d;
+      if (c >= '0' && c <= '9') d = c - '0';
+      else if (hex && c >= 'a' && c <= 'f') d = c - 'a' + 10;
+      else if (hex && c >= 'A' && c <= 'F') d = c - 'A' + 10; else { i = start; break; }
+      cp = cp * (hex ? 16 : 10) + d; }
+    if (i > start && i < n && s[i] == ';' && cp > 0 && cp <= 0x10FFFF) {
+      int w = 0;
+      if (cp < 0x80) out[w++] = (char)cp;
+      else if (cp < 0x800) { out[w++] = 0xC0 | (cp >> 6); out[w++] = 0x80 | (cp & 0x3F); }
+      else if (cp < 0x10000) { out[w++] = 0xE0 | (cp >> 12); out[w++] = 0x80 | ((cp >> 6) & 0x3F); out[w++] = 0x80 | (cp & 0x3F); }
+      else { out[w++] = 0xF0 | (cp >> 18); out[w++] = 0x80 | ((cp >> 12) & 0x3F); out[w++] = 0x80 | ((cp >> 6) & 0x3F); out[w++] = 0x80 | (cp & 0x3F); }
+      *wrote = w; return i + 1;
+    }
+  }
+  return 0;
+}
+// Extract attribute `attr` (e.g. "href") from a tag body h[0..len) into out. Handles
+// quoted ("..", '..') and unquoted values. Returns true if found.
+static bool readerTagAttr(const char* h, size_t len, const char* attr, char* out, size_t cap) {
+  size_t al = strlen(attr);
+  for (size_t i = 0; i + al + 1 < len; i++) {
+    if (!readerCiPrefix(h + i, len - i, attr)) continue;
+    size_t j = i + al; while (j < len && (h[j] == ' ' || h[j] == '\t')) j++;
+    if (j >= len || h[j] != '=') continue;
+    j++; while (j < len && (h[j] == ' ' || h[j] == '\t')) j++;
+    char q = 0; if (j < len && (h[j] == '"' || h[j] == '\'')) { q = h[j]; j++; }
+    size_t o = 0;
+    while (j < len && o + 1 < cap) { char c = h[j]; if (q ? (c == q) : (c == ' ' || c == '>' || c == '\t')) break; out[o++] = c; j++; }
+    out[o] = 0; return o > 0;
+  }
+  return false;
+}
+// Resolve href against base into out (absolute). Returns false for unusable schemes
+// (#fragment, javascript:, mailto:, tel:, data:).
+static bool readerResolveUrl(const char* base, const char* href, char* out, size_t cap) {
+  while (*href == ' ') href++;
+  size_t hl = strlen(href);
+  if (!hl || href[0] == '#') return false;
+  if (readerCiPrefix(href, hl, "javascript:") || readerCiPrefix(href, hl, "mailto:") ||
+      readerCiPrefix(href, hl, "tel:") || readerCiPrefix(href, hl, "data:")) return false;
+  if (readerCiPrefix(href, hl, "http://") || readerCiPrefix(href, hl, "https://")) { snprintf(out, cap, "%s", href); }
+  else {
+    const char* se = strstr(base, "://"); if (!se) return false;
+    int sl = (int)(se - base); const char* host = se + 3;
+    const char* he = strchr(host, '/'); int hlen = he ? (int)(he - host) : (int)strlen(host);
+    if (href[0] == '/' && href[1] == '/')      snprintf(out, cap, "%.*s:%s", sl, base, href);            // //host/path
+    else if (href[0] == '/')                   snprintf(out, cap, "%.*s://%.*s%s", sl, base, hlen, host, href);  // root-relative
+    else {                                                                                              // relative to base dir
+      const char* ls = strrchr(base, '/');
+      if (ls && ls > se + 2) snprintf(out, cap, "%.*s%s", (int)(ls - base + 1), base, href);
+      else                   snprintf(out, cap, "%.*s://%.*s/%s", sl, base, hlen, host, href);
+    }
+  }
+  char* frag = strchr(out, '#'); if (frag) *frag = 0;
+  return out[0] != 0;
+}
+// One-pass HTML -> text. Drops comments + <script>/<style> bodies, turns block tags
+// into newlines, decodes entities, collapses whitespace, and records <a href> ranges
+// (byte offsets into out + resolved absolute href) in s_reader_links. Returns text len.
+static size_t readerHtmlToText(const char* h, size_t n, char* out, size_t cap, const char* base) {
+  size_t o = 0; int pend_nl = 0; bool pend_sp = false, started = false;
+  s_reader_nlinks = 0;
+  bool in_a = false; uint32_t a_start = 0; char a_href[240] = "";
+  auto emit = [&](char c) { if (o + 1 < cap) out[o++] = c; };
+  auto flush = [&]() { if (!started) return; while (pend_nl > 0) { emit('\n'); pend_nl--; } if (pend_sp) { emit(' '); pend_sp = false; } };
+  static const char* blocks[] = { "p","div","br","li","ul","ol","tr","h1","h2","h3","h4","h5","h6",
+    "section","article","header","footer","table","blockquote","pre","hr","nav","title","body", nullptr };
+  size_t i = 0;
+  while (i < n && o + 5 < cap) {
+    char c = h[i];
+    if (c == '<') {
+      if (n - i >= 4 && h[i+1] == '!' && h[i+2] == '-' && h[i+3] == '-') {        // comment
+        size_t j = i + 4; while (j + 2 < n && !(h[j] == '-' && h[j+1] == '-' && h[j+2] == '>')) j++;
+        i = (j + 2 < n) ? j + 3 : n; continue;
+      }
+      bool scr = readerCiPrefix(h + i, n - i, "<script"), sty = !scr && readerCiPrefix(h + i, n - i, "<style");
+      if (scr || sty) {                                                          // skip body wholesale
+        const char* close = scr ? "</script" : "</style"; size_t j = i + 1;
+        while (j < n && !(h[j] == '<' && readerCiPrefix(h + j, n - j, close))) j++;
+        while (j < n && h[j] != '>') j++; i = (j < n) ? j + 1 : n;
+        if (pend_nl < 2) pend_nl++; continue;
+      }
+      size_t j = i + 1; bool closing = (j < n && h[j] == '/'); if (closing) j++;  // tag name
+      char name[12]; int ni = 0;
+      while (j < n && ni < 11) { char t = h[j]; if ((t>='a'&&t<='z')||(t>='A'&&t<='Z')||(t>='0'&&t<='9')) { name[ni++] = (t>='A'&&t<='Z')?t+32:t; j++; } else break; }
+      name[ni] = 0;
+      size_t k = i + 1; while (k < n && h[k] != '>') k++;                          // k = '>' position
+      // Links: record the anchor-text byte range + resolved href.
+      if (name[0] == 'a' && name[1] == 0) {
+        if (in_a) { if (o > a_start && s_reader_links && s_reader_nlinks < kReaderMaxLinks) {
+            s_reader_links[s_reader_nlinks].start = a_start; s_reader_links[s_reader_nlinks].end = (uint32_t)o;
+            snprintf(s_reader_links[s_reader_nlinks].href, sizeof s_reader_links[0].href, "%s", a_href); s_reader_nlinks++; }
+          in_a = false; }
+        if (!closing) { char raw[300];
+          if (base && s_reader_links && readerTagAttr(h + i, (k < n ? k : n) - i, "href", raw, sizeof raw) &&
+              readerResolveUrl(base, raw, a_href, sizeof a_href)) { in_a = true; a_start = (uint32_t)o; } }
+      }
+      i = (k < n) ? k + 1 : n;
+      for (int b = 0; blocks[b]; b++) if (strcmp(name, blocks[b]) == 0) { pend_sp = false; if (pend_nl < 2) pend_nl++; break; }
+      continue;
+    }
+    if (c == '&') {
+      char buf[8]; int w = 0; size_t used = readerEntity(h + i, n - i, buf, &w);
+      if (used) { for (int q = 0; q < w; q++) { char e = buf[q]; if (e == ' ') { if (started) pend_sp = true; } else { flush(); emit(e); started = true; } } i += used; continue; }
+      flush(); emit('&'); started = true; i++; continue;
+    }
+    if (c == ' ' || c == '\t' || c == '\r' || c == '\n') { if (started) pend_sp = true; i++; continue; }
+    flush(); emit(c); started = true; i++;
+  }
+  out[o < cap ? o : cap - 1] = 0; return o;
+}
+// Worker (core 0): fetch s_reader_url, strip to s_reader_text, publish via s_reader_dirty.
+static void readerFetchTaskFn(void*) {
+  char url[300]; strncpy(url, s_reader_url, sizeof url - 1); url[sizeof url - 1] = 0;
+  s_reader_ok = false;
+  const bool https = readerCiPrefix(url, strlen(url), "https://");
+  // Big contiguous PSRAM is scarce on the 2 MB V4 (a chat's message ring fragments it),
+  // so fall back to smaller buffers — a typical text page still fits in 48 KB.
+  size_t rawcap = kReaderRawCap;
+  uint8_t* raw = (uint8_t*)heap_caps_malloc(rawcap, MALLOC_CAP_SPIRAM);
+  if (!raw) { rawcap = 96 * 1024; raw = (uint8_t*)heap_caps_malloc(rawcap, MALLOC_CAP_SPIRAM); }
+  if (!raw) { rawcap = 48 * 1024; raw = (uint8_t*)heap_caps_malloc(rawcap, MALLOC_CAP_SPIRAM); }
+  if (!raw) { rawcap = 24 * 1024; raw = (uint8_t*)heap_caps_malloc(rawcap, MALLOC_CAP_SPIRAM); }
+  int code = -1; size_t total = 0;
+  if (raw) {
+    HTTPClient httpc;
+    httpc.setReuse(false); httpc.setConnectTimeout(9000); httpc.setTimeout(15000);
+    httpc.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS); httpc.setUserAgent("wadamesh-reader");
+    WiFiClientSecure scli; WiFiClient pcli; bool began;
+    if (https) { scli.setInsecure(); began = httpc.begin(scli, url); }
+    else       {                       began = httpc.begin(pcli, url); }
+    if (began) { httpc.addHeader("Accept-Encoding", "identity"); code = httpc.GET(); }
+    if (code == HTTP_CODE_OK) {
+      WiFiClient* st = httpc.getStreamPtr(); unsigned long t0 = millis();
+      while (st && total < rawcap - 1 && (millis() - t0) < 20000) {
+        int a = st->available();
+        if (a <= 0) { if (!httpc.connected()) break; vTaskDelay(pdMS_TO_TICKS(8)); continue; }
+        int r = st->read(raw + total, (rawcap - 1) - total);
+        if (r <= 0) { if (!httpc.connected()) break; vTaskDelay(pdMS_TO_TICKS(5)); continue; }
+        total += (size_t)r;
+        if ((total & 0x3FFF) == 0) { snprintf(s_reader_msg, sizeof s_reader_msg, "Loading\xe2\x80\xa6 %uk", (unsigned)(total / 1024)); s_reader_dirty = true; }
+        vTaskDelay(1);
+      }
+    }
+    httpc.end();
+  }
+  if (!raw) snprintf(s_reader_msg, sizeof s_reader_msg, "Out of memory");
+  else if (code == HTTP_CODE_OK && total >= 2 && raw[0] == 0x1f && (uint8_t)raw[1] == 0x8b)
+    snprintf(s_reader_msg, sizeof s_reader_msg, "Page is gzip-compressed \xe2\x80\x94 not supported yet");
+  else if (code == HTTP_CODE_OK && total > 0) {
+    if (!s_reader_text)  s_reader_text  = (char*)heap_caps_malloc(kReaderTextCap, MALLOC_CAP_SPIRAM);
+    if (!s_reader_links) s_reader_links = (ReaderLink*)heap_caps_malloc(sizeof(ReaderLink) * kReaderMaxLinks, MALLOC_CAP_SPIRAM);
+    if (s_reader_text) { size_t tl = readerHtmlToText((const char*)raw, total, s_reader_text, kReaderTextCap, s_reader_url);
+      if (tl == 0) { strcpy(s_reader_text, "(no readable text on this page)"); s_reader_nlinks = 0; }
+      snprintf(s_reader_msg, sizeof s_reader_msg, "%s", s_reader_url); s_reader_ok = true; }
+    else snprintf(s_reader_msg, sizeof s_reader_msg, "Out of memory");
+  }
+  else if (code > 0) { snprintf(s_reader_msg, sizeof s_reader_msg, "HTTP %d", code); }
+  else               { snprintf(s_reader_msg, sizeof s_reader_msg, "Couldn't load (offline, bad URL, or TLS failed)"); }
+  if (raw) heap_caps_free(raw);
+  s_reader_busy = false; s_reader_dirty = true; s_reader_task = nullptr;
+  vTaskDelete(nullptr);
+}
+// Navigate to a URL. push=true records it in history (a fresh navigation from Go / a
+// link / Enter); push=false is a back / forward / refresh replay that must NOT grow
+// history. readerStart() is the public "new navigation" entry point.
+static void readerNavigate(const char* in, bool push) {
+  if (s_reader_busy || !in) return;
+  while (*in == ' ') in++;
+  if (readerCiPrefix(in, strlen(in), "http://") || readerCiPrefix(in, strlen(in), "https://"))
+       snprintf(s_reader_url, sizeof s_reader_url, "%s", in);
+  else snprintf(s_reader_url, sizeof s_reader_url, "https://%s", in);   // default to https
+  // Keep the address field in sync with what we're actually loading, so a failed load
+  // shows the URL we tried (not the stale default that made it look like it "opened
+  // wadamesh.com").
+  if (s_reader_url_ta) { lv_textarea_set_text(s_reader_url_ta, s_reader_url); s_reader_pristine = false; }
+  if (!s_reader_url[0] || !strchr(s_reader_url, '.')) { snprintf(s_reader_msg, sizeof s_reader_msg, "Enter a valid URL"); s_reader_dirty = true; if (s_reader_root) readerSetAddrExpanded(true); return; }
+  if (WiFi.status() != WL_CONNECTED) { snprintf(s_reader_msg, sizeof s_reader_msg, "Wi-Fi not connected (Settings \xe2\x86\x92 Wi-Fi)"); s_reader_dirty = true; if (s_reader_root) readerSetAddrExpanded(true); return; }
+  if (push && s_reader_hist) {
+    // Drop any forward tail, then push (unless it repeats the current entry).
+    if (s_reader_hist_pos < 0 || strcmp(s_reader_hist[s_reader_hist_pos], s_reader_url) != 0) {
+      if (s_reader_hist_pos + 1 >= kReaderHistMax) {   // full: slide the window down one
+        memmove(s_reader_hist[0], s_reader_hist[1], sizeof(s_reader_hist[0]) * (kReaderHistMax - 1));
+        s_reader_hist_pos = kReaderHistMax - 2;
+      }
+      snprintf(s_reader_hist[++s_reader_hist_pos], 300, "%s", s_reader_url);
+    }
+    s_reader_hist_n = s_reader_hist_pos + 1;
+  }
+  s_reader_busy = true; snprintf(s_reader_msg, sizeof s_reader_msg, "Connecting\xe2\x80\xa6"); s_reader_dirty = true;
+  readerUpdateNavButtons();
+  // Immediate feedback (we're on the UI thread): collapse the URL into the topbar and
+  // show a Loading placeholder at once, so a tapped link visibly does something now.
+  if (s_reader_root) { readerSetAddrExpanded(false); readerShowLoading(); }
+  if (xTaskCreatePinnedToCore(readerFetchTaskFn, "reader", 16384, nullptr, 4, &s_reader_task, 0) != pdPASS) {
+    // Couldn't spawn the fetch worker (low internal RAM) — don't leave it stuck on
+    // "Loading…" forever; surface it and drop the busy flag so a retry works.
+    s_reader_task = nullptr; s_reader_busy = false;
+    snprintf(s_reader_msg, sizeof s_reader_msg, "Low memory \xe2\x80\x94 try again");
+    s_reader_ok = false; s_reader_dirty = true;
+  }
+}
+static void readerStart(const char* in) { readerNavigate(in, true); }
+static void readerBackCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED || s_reader_busy) return;
+  if (s_reader_hist_pos > 0) readerNavigate(s_reader_hist[--s_reader_hist_pos], false);
+  else closeReaderPage();   // at the first page, the ◀ button exits the browser (reliable exit)
+}
+static void readerFwdCb(lv_event_t* e)     { if (lv_event_get_code(e) == LV_EVENT_CLICKED && !s_reader_busy && s_reader_hist && s_reader_hist_pos + 1 < s_reader_hist_n) readerNavigate(s_reader_hist[++s_reader_hist_pos], false); }
+static void readerRefreshCb(lv_event_t* e) { if (lv_event_get_code(e) == LV_EVENT_CLICKED && !s_reader_busy && s_reader_url[0])                             readerNavigate(s_reader_url, false); }
+// Dim the back / forward arrows when there's nowhere to go that way.
+static void readerUpdateNavButtons() {
+  auto dim = [](lv_obj_t* b, bool on) { if (!b) return; lv_obj_t* l = lv_obj_get_child(b, 0); if (l) lv_obj_set_style_text_opa(l, on ? LV_OPA_COVER : LV_OPA_30, LV_PART_MAIN); };
+  dim(s_reader_back, true);   // always active: goes back in history, or exits at the first page
+  dim(s_reader_fwd,  s_reader_hist && s_reader_hist_pos + 1 < s_reader_hist_n);
+}
+static void readerGoCb(lv_event_t*) { if (s_reader_url_ta) readerStart(lv_textarea_get_text(s_reader_url_ta)); }
+static void readerUrlReadyCb(lv_event_t* e) { if (lv_event_get_code(e) == LV_EVENT_READY && s_reader_url_ta) readerStart(lv_textarea_get_text(s_reader_url_ta)); }
+// Tapping the pre-filled default clears it so you type over a blank field.
+static void readerUrlFocusCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_FOCUSED) return;
+  if (s_reader_pristine && s_reader_url_ta) { lv_textarea_set_text(s_reader_url_ta, ""); s_reader_pristine = false; }
+}
+static void readerUrlChangedCb(lv_event_t* e) { if (lv_event_get_code(e) == LV_EVENT_VALUE_CHANGED) s_reader_pristine = false; }
+// Tap a link -> navigate to its resolved href.
+static void readerLinkClickCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED || s_reader_busy || !s_reader_links) return;
+  int idx = (int)(intptr_t)lv_event_get_user_data(e);
+  if (idx >= 0 && idx < s_reader_nlinks) readerStart(s_reader_links[idx].href);
+}
+// Show/hide the address bar: expanded = URL field + Go (entry); collapsed = a thin
+// button showing the loaded URL (so the page text gets almost the whole screen).
+static const int kReaderNavH = 14;                     // bottom toolbar height (thin)
+static inline int readerEditTop() { return STATUSBAR_H + 4; }  // edit row sits BELOW the tall bar (live: STATUSBAR_H scales)
+static void readerSetAddrExpanded(bool exp) {
+  if (!s_reader_root) return;
+  const lv_coord_t sw = lv_disp_get_hor_res(nullptr), sh = lv_disp_get_ver_res(nullptr);
+  const int H = sh - STATUSBAR_H;
+  auto vis = [](lv_obj_t* o, bool show) { if (!o) return; if (show) lv_obj_clear_flag(o, LV_OBJ_FLAG_HIDDEN); else lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN); };
+  vis(s_reader_url_ta, exp); vis(s_reader_go, exp); vis(s_reader_status, exp);
+  // The topbar ALWAYS shows a plain "‹ Web" (like the RF Monitor page) — no URL in the
+  // bar (it was interfering with the back tap). The address only appears in the edit
+  // field, which opens from the ✎ pencil in the bottom toolbar. Reading (collapsed):
+  // fullscreen body. Editing (expanded): the field + Go sit clear of the tall bar.
+  s_apppage_title  = "Web";
+  s_reader_bar_url = false;
+  updateGlobalStatusBar();
+  const int body_y = exp ? (readerEditTop() + 72) : (STATUSBAR_H + 2);
+  if (s_reader_scroll) { lv_obj_set_pos(s_reader_scroll, 4, body_y);
+    lv_obj_set_size(s_reader_scroll, sw - 8, (H - kReaderNavH) - body_y - 4); }
+  readerUpdateNavButtons();
+}
+static void readerShowMessage(const char* msg, uint32_t color) {
+  if (!s_reader_scroll) return;
+  lv_obj_clean(s_reader_scroll);
+  lv_obj_set_flex_flow(s_reader_scroll, LV_FLEX_FLOW_COLUMN);
+  lv_obj_t* l = lv_label_create(s_reader_scroll);
+  lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
+  lv_obj_set_width(l, lv_disp_get_hor_res(nullptr) - 8 - 16);
+  lv_obj_set_style_text_font(l, &g_font_14, LV_PART_MAIN);
+  lv_obj_set_style_text_color(l, lv_color_hex(color), LV_PART_MAIN);
+  lv_label_set_text(l, msg);
+}
+static void readerShowLoading() { readerShowMessage(LV_SYMBOL_REFRESH "  Loading\xe2\x80\xa6", 0x6FB7FF); }
+// Rebuild the body: flowing text split into paragraph labels + tappable link labels.
+static void readerRenderBody() {
+  if (!s_reader_scroll) return;
+  lv_obj_clean(s_reader_scroll);
+  lv_obj_set_flex_flow(s_reader_scroll, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(s_reader_scroll, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+  lv_obj_set_style_pad_row(s_reader_scroll, 2, LV_PART_MAIN);
+  const int cw = lv_disp_get_hor_res(nullptr) - 8 - 16;
+  auto mkLabel = [&](const char* s, bool link, int idx) {
+    lv_obj_t* l = lv_label_create(s_reader_scroll);
+    lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(l, cw);
+    lv_obj_set_style_text_font(l, &g_font_14, LV_PART_MAIN);
+    lv_obj_set_style_text_color(l, lv_color_hex(link ? 0x6FB7FF : COLOR_TEXT), LV_PART_MAIN);
+    if (link) {
+      lv_obj_set_style_text_decor(l, LV_TEXT_DECOR_UNDERLINE, LV_PART_MAIN);
+      lv_obj_add_flag(l, LV_OBJ_FLAG_CLICKABLE);
+      lv_obj_add_event_cb(l, readerLinkClickCb, LV_EVENT_CLICKED, (void*)(intptr_t)idx);
+    }
+    lv_label_set_text(l, s);
+  };
+  if (!s_reader_text || !s_reader_text[0]) {
+    mkLabel("Type a URL above and tap Go.\n\nText-only: reads the words on a page (articles, wikis, docs, plain sites). No JavaScript, images or logins. Links are tappable.", false, -1);
+    return;
+  }
+  // Walk the text, emitting text[cursor..link.start] as paragraphs and each link
+  // range as a tappable label. NUL-swap in place so we never copy big runs.
+  const uint32_t tlen = (uint32_t)strlen(s_reader_text);
+  uint32_t cursor = 0; int blocks = 0;
+  for (int i = 0; i < s_reader_nlinks && blocks < 500; i++) {
+    ReaderLink& lk = s_reader_links[i];
+    if (lk.start < cursor || lk.end > tlen || lk.end <= lk.start) continue;
+    if (lk.start > cursor) { char sv = s_reader_text[lk.start]; s_reader_text[lk.start] = 0; mkLabel(s_reader_text + cursor, false, -1); s_reader_text[lk.start] = sv; blocks++; }
+    { char sv = s_reader_text[lk.end]; s_reader_text[lk.end] = 0; mkLabel(s_reader_text[lk.start] ? s_reader_text + lk.start : "(link)", true, i); s_reader_text[lk.end] = sv; blocks++; }
+    cursor = lk.end;
+  }
+  if (cursor < tlen) mkLabel(s_reader_text + cursor, false, -1);
+  lv_obj_scroll_to_y(s_reader_scroll, 0, LV_ANIM_OFF);
+}
+static void closeReaderPage() {
+  if (!s_reader_root) return;
+  s_apppage_title = nullptr; s_apppage_close = nullptr;
+  s_reader_bar_url = false;   // un-hide the status-bar clock
+  s_reader_page_open = false; // restore the tall-bar glass fade for other pages
+  s_reader_hist_n = 0; s_reader_hist_pos = -1;   // fresh history next open (buffer kept in PSRAM)
+  statusBarSetTall(false); updateGlobalStatusBar();
+  popupClose(&s_reader_root);
+  s_reader_url_ta = s_reader_go = s_reader_editbtn = s_reader_scroll = s_reader_status = nullptr;   // a running worker only touches s_reader_text/msg/flags/links — safe
+  s_reader_navbar = s_reader_back = s_reader_fwd = nullptr;
+}
+// The floating edit button (shown while reading) reopens the address field.
+static void readerEditBtnCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  readerSetAddrExpanded(true);
+  if (s_reader_url_ta) { lv_textarea_set_text(s_reader_url_ta, s_reader_url); s_reader_pristine = false; lv_group_focus_obj(s_reader_url_ta); }
+}
+static void openReaderPage() {
+  closeReaderPage();
+  const lv_coord_t sw = lv_disp_get_hor_res(nullptr);
+  const lv_coord_t sh = lv_disp_get_ver_res(nullptr);
+  const int H = sh - STATUSBAR_H;
+  s_reader_root = lv_obj_create(lv_layer_top());
+  lv_obj_remove_style_all(s_reader_root);
+  lv_obj_set_size(s_reader_root, sw, H);
+  lv_obj_set_pos(s_reader_root, 0, STATUSBAR_H);
+  lv_obj_set_style_bg_color(s_reader_root, lv_color_hex(COLOR_BG), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(s_reader_root, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_clear_flag(s_reader_root, LV_OBJ_FLAG_SCROLLABLE);
+  s_apppage_title = "Web"; s_apppage_close = closeReaderPage;   // ‹ / bar tap always closes the app
+  s_reader_page_open = true;   // solid tall bar on this page (no glass fade)
+  statusBarSetTall(true); updateGlobalStatusBar();
+  if (!s_reader_hist) s_reader_hist = (char(*)[300])psAlloc(sizeof(s_reader_hist[0]) * kReaderHistMax);
+  const int top = readerEditTop(), gow = 50;   // edit row sits clear of the tall bar
+  // --- Expanded address bar: URL field + Go ---
+  s_reader_url_ta = lv_textarea_create(s_reader_root);
+  lv_textarea_set_one_line(s_reader_url_ta, true);
+  lv_textarea_set_placeholder_text(s_reader_url_ta, "Type a URL, then Go");
+  if (s_reader_url[0]) { lv_textarea_set_text(s_reader_url_ta, s_reader_url); s_reader_pristine = false; }
+  else                 { lv_textarea_set_text(s_reader_url_ta, kReaderDefaultUrl); s_reader_pristine = true; }
+  lv_obj_set_pos(s_reader_url_ta, 6, top);
+  lv_obj_set_size(s_reader_url_ta, sw - 6 - gow - 14, 36);
+  lv_obj_set_style_text_font(s_reader_url_ta, &g_font_14, LV_PART_MAIN);
+  attachSettingsTaEvents(s_reader_url_ta);   // keyboard + edit; keeps backspace in the field
+  lv_obj_add_event_cb(s_reader_url_ta, readerUrlReadyCb,   LV_EVENT_READY,         nullptr);   // Enter = Go
+  lv_obj_add_event_cb(s_reader_url_ta, readerUrlFocusCb,   LV_EVENT_FOCUSED,       nullptr);   // clear the default on tap
+  lv_obj_add_event_cb(s_reader_url_ta, readerUrlChangedCb, LV_EVENT_VALUE_CHANGED, nullptr);
+  s_reader_go = lv_btn_create(s_reader_root);
+  lv_obj_set_size(s_reader_go, gow, 36);
+  lv_obj_align_to(s_reader_go, s_reader_url_ta, LV_ALIGN_OUT_RIGHT_MID, 8, 0);
+  styleButton(s_reader_go);
+  lv_obj_add_event_cb(s_reader_go, readerGoCb, LV_EVENT_CLICKED, nullptr);
+  { lv_obj_t* gl = lv_label_create(s_reader_go); lv_label_set_text(gl, "Go"); lv_obj_center(gl); }
+  s_reader_status = lv_label_create(s_reader_root);
+  lv_label_set_long_mode(s_reader_status, LV_LABEL_LONG_DOT);
+  lv_obj_set_width(s_reader_status, sw - 12);
+  lv_obj_set_pos(s_reader_status, 6, top + 44);
+  lv_obj_set_style_text_font(s_reader_status, &g_font_12, LV_PART_MAIN);
+  lv_obj_set_style_text_color(s_reader_status, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+  lv_label_set_text(s_reader_status, s_reader_msg[0] ? s_reader_msg : "On-device text browser \xc2\xb7 no proxy, no tracking");
+  // (Collapsed state shows the URL in the status-bar title zone — see readerSetAddrExpanded.)
+  // --- Body: a vertical scroll container we fill with paragraph + link labels ---
+  s_reader_scroll = lv_obj_create(s_reader_root);
+  lv_obj_remove_style_all(s_reader_scroll);
+  lv_obj_set_style_bg_color(s_reader_scroll, lv_color_hex(0x14161A), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(s_reader_scroll, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_radius(s_reader_scroll, 6, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(s_reader_scroll, 8, LV_PART_MAIN);
+  lv_obj_set_scroll_dir(s_reader_scroll, LV_DIR_VER);
+  // --- Bottom toolbar: back / forward / refresh / edit-URL (always visible) ---
+  s_reader_navbar = lv_obj_create(s_reader_root);
+  lv_obj_remove_style_all(s_reader_navbar);
+  lv_obj_set_size(s_reader_navbar, sw, kReaderNavH);
+  lv_obj_set_pos(s_reader_navbar, 0, H - kReaderNavH);
+  lv_obj_set_style_bg_color(s_reader_navbar, lv_color_hex(0x000000), LV_PART_MAIN);   // black bar
+  lv_obj_set_style_bg_opa(s_reader_navbar, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_border_color(s_reader_navbar, lv_color_hex(0x222222), LV_PART_MAIN);
+  lv_obj_set_style_border_width(s_reader_navbar, 1, LV_PART_MAIN);
+  lv_obj_set_style_border_side(s_reader_navbar, LV_BORDER_SIDE_TOP, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(s_reader_navbar, 0, LV_PART_MAIN);
+  lv_obj_clear_flag(s_reader_navbar, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_flex_flow(s_reader_navbar, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(s_reader_navbar, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  auto navBtn = [&](const char* sym, lv_event_cb_t cb) -> lv_obj_t* {
+    lv_obj_t* b = lv_btn_create(s_reader_navbar);
+    lv_obj_remove_style_all(b);
+    lv_obj_set_size(b, 46, kReaderNavH - 2);
+    lv_obj_set_style_bg_opa(b, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_radius(b, 3, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(b, lv_color_hex(0x1E1E1E), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(b, LV_OPA_COVER, LV_STATE_PRESSED);
+    lv_obj_set_ext_click_area(b, 8);   // thin bar, so pad the tap target
+    lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t* l = lv_label_create(b); lv_label_set_text(l, sym); lv_obj_center(l);
+    lv_obj_set_style_text_font(l, &g_font_12, LV_PART_MAIN);
+    lv_obj_set_style_text_color(l, lv_color_hex(0x9FD8FF), LV_PART_MAIN);
+    return b;
+  };
+  s_reader_back    = navBtn(LV_SYMBOL_LEFT,    readerBackCb);
+  s_reader_fwd     = navBtn(LV_SYMBOL_RIGHT,   readerFwdCb);
+  navBtn(LV_SYMBOL_REFRESH, readerRefreshCb);
+  s_reader_editbtn = navBtn(LV_SYMBOL_EDIT,    readerEditBtnCb);
+  readerRenderBody();
+  // Reopen after a successful load -> collapsed (fullscreen reading); first open or
+  // after an error -> expanded so you can type a URL.
+  readerSetAddrExpanded(!(s_reader_ok && s_reader_text && s_reader_text[0]));
+  // Force the status bar ABOVE the reader so its "‹ title" back tap is hittable. The
+  // shared move-foreground in updateGlobalStatusBar is edge-triggered and can miss when
+  // this page opens over a chat, leaving the tall bar's lower row (the back tap) buried
+  // under the reader root.
+  if (g_statusbar.root) lv_obj_move_foreground(g_statusbar.root);
+}
+#endif  // Reader
+
 static void openMonitorPage() {
   closeMonitorPage();
   const lv_coord_t sw = lv_disp_get_hor_res(nullptr);
@@ -20308,10 +20800,10 @@ static void makeHome(lv_obj_t* tab) {
     lv_obj_set_style_bg_opa(hint, LV_OPA_70, LV_PART_MAIN);
     lv_obj_set_style_pad_hor(hint, 3, LV_PART_MAIN);
     lv_obj_set_style_radius(hint, 3, LV_PART_MAIN);
-    // Bottom-right (per the design note above), opposite corner from the top-left
-    // "Sig --" chip — so a longer translation ("touchez pour les détails") no longer
-    // overlaps it. (It was TOP_RIGHT, which only cleared "Sig" for the short EN text.)
-    lv_obj_align(hint, LV_ALIGN_BOTTOM_RIGHT, -2, -2);
+    // Top-right (by request), opposite the top-left "Sig --" chip. On a longer
+    // translation it sits close to the Sig chip, but keeping the cue at the top of the
+    // box is preferred.
+    lv_obj_align(hint, LV_ALIGN_TOP_RIGHT, -2, 2);
   }
 
 #if CAP_LARGE_SCREEN
@@ -28100,6 +28592,216 @@ static void chatVirtCreateDaySeparator(LvChatPanel* p, int logical_i, lv_coord_t
   lv_obj_set_user_data(dl, reinterpret_cast<void*>(static_cast<intptr_t>(-(logical_i + 1))));
 }
 
+// ============================ Clickable URLs in chat ================================
+// Detect URLs in a message, tint them blue, and on a short tap offer "Open in web" (the
+// on-device reader) or "Create QR" (an on-screen QR so a phone can grab the link).
+// UNGATED (QR works on every board); the "Open in web" button compiles only where the
+// reader exists.
+static bool urlCiHas(const char* s, const char* pfx, int n) {
+  for (int i = 0; i < n; i++) { char a = s[i]; if (!a) return false; if (a >= 'A' && a <= 'Z') a += 32; if (a != pfx[i]) return false; }
+  return true;
+}
+// First URL span [*a,*b) at/after `from`. Recognises http(s):// and a bare www.<host>.
+static bool chatUrlSpan(const char* s, int from, int* a, int* b) {
+  for (int i = from; s[i]; i++) {
+    int len = 0;
+    if      (urlCiHas(s + i, "https://", 8)) len = 8;
+    else if (urlCiHas(s + i, "http://",  7)) len = 7;
+    else if (urlCiHas(s + i, "www.", 4) && (i == 0 || s[i-1] == ' ' || s[i-1] == '\n')) len = 4;
+    else continue;
+    int j = i + len;
+    while (s[j] && (unsigned char)s[j] > ' ') j++;                 // extend to whitespace
+    while (j > i + len) { char c = s[j-1];                          // trim trailing punctuation
+      if (c=='.'||c==','||c==')'||c==';'||c=='!'||c=='?'||c=='\''||c=='"'||c==':') j--; else break; }
+    if (j <= i + len) continue;                                    // scheme, no host
+    if (!memchr(s + i + len, '.', j - (i + len))) continue;        // host needs a dot
+    *a = i; *b = j; return true;
+  }
+  return false;
+}
+static bool chatFirstUrl(const char* s, char* out, int cap) {
+  int a, b; if (!s || !chatUrlSpan(s, 0, &a, &b)) return false;
+  int n = b - a; if (n > cap - 1) n = cap - 1;
+  memcpy(out, s + a, n); out[n] = 0; return true;
+}
+// Copy `in` -> `out`, wrapping each URL in a blue recolor tag. Bails (false) if `in`
+// already has a '#' (the recolor parser would choke on it) — caller then shows plain
+// text and the tap still works.
+static bool chatRecolorUrls(const char* in, char* out, int cap) {
+  if (!in || strchr(in, '#')) return false;
+  int a, b; if (!chatUrlSpan(in, 0, &a, &b)) return false;
+  int o = 0, i = 0;
+  while (in[i] && o < cap - 12) {
+    if (i == a) {
+      o += snprintf(out + o, cap - o, "#4EA1FF ");
+      while (i < b && o < cap - 2) out[o++] = in[i++];
+      if (o < cap - 1) out[o++] = '#';
+      if (!chatUrlSpan(in, i, &a, &b)) a = -1;
+    } else out[o++] = in[i++];
+  }
+  out[o] = 0; return true;
+}
+
+// ---- QR popup: a scannable QR of a URL ----
+static lv_obj_t* s_urlqr_root = nullptr;
+static void closeUrlQr() { if (s_urlqr_root) popupClose(&s_urlqr_root); }
+static void urlQrBackdropCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  lv_indev_t* a = lv_indev_get_act(); if (a) lv_indev_wait_release(a);
+  closeUrlQr();
+}
+static void openUrlQrPopup(const char* url) {
+  closeUrlQr();
+  lv_coord_t sw = lv_disp_get_hor_res(nullptr), sh = lv_disp_get_ver_res(nullptr);
+  s_urlqr_root = lv_obj_create(lv_layer_top());
+  lv_obj_remove_style_all(s_urlqr_root);
+  lv_obj_set_size(s_urlqr_root, sw, sh - STATUSBAR_H);
+  lv_obj_set_pos(s_urlqr_root, 0, STATUSBAR_H);
+  lv_obj_set_style_bg_color(s_urlqr_root, lv_color_hex(0x000000), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(s_urlqr_root, LV_OPA_60, LV_PART_MAIN);
+  lv_obj_clear_flag(s_urlqr_root, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_event_cb(s_urlqr_root, urlQrBackdropCb, LV_EVENT_CLICKED, nullptr);
+  int card_w = PSC(230); if (card_w > modalAvailW()) card_w = modalAvailW();
+  int card_h = PSC(250); if (card_h > modalAvailH()) card_h = modalAvailH();
+  int qr_size = card_h - 34 - 34 - 20; if (qr_size > PSC(160)) qr_size = PSC(160);
+  if (qr_size > card_w - 20) qr_size = card_w - 20; if (qr_size < 96) qr_size = 96;
+  lv_obj_t* card = lv_obj_create(s_urlqr_root);
+  lv_obj_remove_style_all(card);
+  lv_obj_set_size(card, card_w, card_h);
+  lv_obj_align(card, LV_ALIGN_CENTER, 0, 0);
+  lv_obj_set_style_bg_color(card, lv_color_hex(COLOR_PANEL), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(card, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_radius(card, 8, LV_PART_MAIN);
+  lv_obj_set_style_border_color(card, lv_color_hex(0x18191A), LV_PART_MAIN);
+  lv_obj_set_style_border_width(card, 1, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(card, 10, LV_PART_MAIN);
+  lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+  addCloseXBadge(card, urlQrBackdropCb);
+  lv_obj_t* title = lv_label_create(card);
+  lv_label_set_text(title, TR("Scan to open on phone"));
+  lv_label_set_long_mode(title, LV_LABEL_LONG_DOT);
+  lv_obj_set_width(title, card_w - 20 - 32);
+  lv_obj_set_style_text_color(title, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+  lv_obj_set_style_text_font(title, &g_font_14, LV_PART_MAIN);
+  lv_obj_set_pos(title, 0, 4);
+  char full[260];   // a bare www. host gets https:// so the phone opens it
+  if (!urlCiHas(url, "http", 4)) snprintf(full, sizeof full, "https://%s", url);
+  else                          snprintf(full, sizeof full, "%s", url);
+  lv_obj_t* qr = lv_qrcode_create(card, qr_size, lv_color_hex(0x000000), lv_color_hex(0xFFFFFF));
+  lv_qrcode_update(qr, full, strlen(full));
+  lv_obj_align(qr, LV_ALIGN_TOP_MID, 0, 32);
+  lv_obj_set_style_border_color(qr, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+  lv_obj_set_style_border_width(qr, 4, LV_PART_MAIN);
+  lv_obj_t* u = lv_label_create(card);
+  lv_label_set_long_mode(u, LV_LABEL_LONG_DOT);
+  lv_obj_set_width(u, card_w - 20);
+  lv_label_set_text(u, url);
+  lv_obj_set_style_text_font(u, &g_font_12, LV_PART_MAIN);
+  lv_obj_set_style_text_color(u, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+  lv_obj_align(u, LV_ALIGN_BOTTOM_MID, 0, -2);
+}
+
+// ---- URL action menu (short tap on a chat URL) ----
+static lv_obj_t* s_urlmenu_root = nullptr;
+static char      s_urlmenu_url[240] = "";
+static void closeUrlMenu() { if (s_urlmenu_root) popupClose(&s_urlmenu_root); }
+static void urlMenuBackdropCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  lv_indev_t* a = lv_indev_get_act(); if (a) lv_indev_wait_release(a);
+  closeUrlMenu();
+}
+static void urlMenuQrCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  char u[240]; snprintf(u, sizeof u, "%s", s_urlmenu_url);
+  closeUrlMenu(); openUrlQrPopup(u);
+}
+#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION) && CAP_WEB_BROWSER
+static void urlMenuOpenWebCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  char u[240]; snprintf(u, sizeof u, "%s", s_urlmenu_url);
+  hideKb();
+  // Delete the URL menu with a PLAIN async delete — NOT closeUrlMenu(), which calls
+  // lv_indev_wait_release() (that wedges the fresh reader's first taps).
+  if (s_urlmenu_root) { lv_obj_del_async(s_urlmenu_root); s_urlmenu_root = nullptr; }
+  // Leave the chat so the reader opens from a CLEAN state — the exact same state as the
+  // app-drawer path, which loads pages and closes with the top ‹ correctly. It also
+  // frees the RAM the on-device HTTPS/TLS handshake needs on the 2 MB V4.
+  if (g_lv.dm.detail_open)      closeChatPanel(&g_lv.dm);
+  else if (g_lv.ch.detail_open) closeChatPanel(&g_lv.ch);
+  // Fresh navigation: drop any stale busy flag (with no worker running it would skip the
+  // new fetch) and the previous page so openReaderPage doesn't re-render the last URL.
+  if (!s_reader_task) s_reader_busy = false;
+  s_reader_ok = false;
+  openReaderPage(); readerStart(u);
+}
+#endif
+static void openUrlMenu(const char* url) {
+  if (!url || !url[0]) return;
+  closeUrlMenu();
+  snprintf(s_urlmenu_url, sizeof s_urlmenu_url, "%s", url);
+  lv_coord_t sw = lv_disp_get_hor_res(nullptr), sh = lv_disp_get_ver_res(nullptr);
+  s_urlmenu_root = lv_obj_create(lv_layer_top());
+  lv_obj_remove_style_all(s_urlmenu_root);
+  lv_obj_set_size(s_urlmenu_root, sw, sh - STATUSBAR_H);
+  lv_obj_set_pos(s_urlmenu_root, 0, STATUSBAR_H);
+  lv_obj_set_style_bg_color(s_urlmenu_root, lv_color_hex(0x000000), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(s_urlmenu_root, LV_OPA_60, LV_PART_MAIN);
+  lv_obj_clear_flag(s_urlmenu_root, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_event_cb(s_urlmenu_root, urlMenuBackdropCb, LV_EVENT_CLICKED, nullptr);
+  const int card_w = PSC(230), btn_h = PSC(34), pad = PSC(12), gap = PSC(8), url_h = PSC(18);
+#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+  const int nbtn = 2;
+#else
+  const int nbtn = 1;
+#endif
+  const int card_h = pad + url_h + gap + nbtn * btn_h + (nbtn - 1) * gap + pad;
+  lv_obj_t* card = lv_obj_create(s_urlmenu_root);
+  lv_obj_remove_style_all(card);
+  lv_obj_set_size(card, card_w, card_h);
+  lv_obj_align(card, LV_ALIGN_CENTER, 0, 0);
+  lv_obj_set_style_bg_color(card, lv_color_hex(COLOR_PANEL), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(card, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_radius(card, 8, LV_PART_MAIN);
+  lv_obj_set_style_border_color(card, lv_color_hex(0x18191A), LV_PART_MAIN);
+  lv_obj_set_style_border_width(card, 1, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(card, pad, LV_PART_MAIN);
+  lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_t* u = lv_label_create(card);        // URL preview line at the top
+  lv_label_set_long_mode(u, LV_LABEL_LONG_DOT);
+  lv_obj_set_width(u, card_w - 2 * pad);
+  lv_label_set_text(u, url);
+  lv_obj_set_style_text_font(u, &g_font_12, LV_PART_MAIN);
+  lv_obj_set_style_text_color(u, lv_color_hex(0x6FB7FF), LV_PART_MAIN);
+  lv_obj_set_pos(u, 0, 0);
+  int by = url_h + gap;
+  auto mk = [&](const char* txt, lv_event_cb_t cb) {
+    lv_obj_t* b = lv_btn_create(card);
+    lv_obj_set_size(b, card_w - 2 * pad, btn_h);
+    lv_obj_set_pos(b, 0, by);
+    styleButton(b);
+    lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t* l = lv_label_create(b); lv_label_set_text(l, TR(txt));
+    lv_obj_set_style_text_font(l, &g_font_14, LV_PART_MAIN);
+    lv_obj_set_style_text_color(l, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+    lv_obj_center(l);
+    by += btn_h + gap;
+  };
+#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION) && CAP_WEB_BROWSER
+  mk(LV_SYMBOL_WIFI "  Open in web", urlMenuOpenWebCb);
+#endif
+  mk(LV_SYMBOL_IMAGE "  Create QR", urlMenuQrCb);
+}
+// Short tap on a chat bubble that contains a URL -> the action menu (re-extract the URL
+// from the live message; the ring may have rotated since the bubble was built).
+static void bubbleUrlTapCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_SHORT_CLICKED || !g_lv.task) return;
+  const int idx = (int)(intptr_t)lv_event_get_user_data(e);
+  UITask::UIMessage m;
+  if (!g_lv.task->getMessageByIndex(idx, m)) return;
+  char url[240];
+  if (chatFirstUrl(m.text, url, sizeof url)) openUrlMenu(url);
+}
+
 static lv_coord_t chatVirtCreateBubble(LvChatPanel* p, int logical_i, int ring_idx,
                                        lv_coord_t vp_y, lv_coord_t* out_jump_y) {
   if (!p || !g_lv.task) return 0;
@@ -28148,6 +28850,13 @@ static lv_coord_t chatVirtCreateBubble(LvChatPanel* p, int logical_i, int ring_i
   lv_obj_set_style_text_font(tlbl, &g_font_12, LV_PART_MAIN);
   lv_obj_set_style_text_color(tlbl, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
   lv_label_set_text(tlbl, d.san_text);
+  // Clickable URLs: tint any link blue (recolor tags are zero-width, so wrapping/height
+  // below still measure from the plain d.san_text and stay correct).
+  int _ua, _ub; const bool has_url = chatUrlSpan(d.san_text, 0, &_ua, &_ub);
+  if (has_url) {
+    char rc[UITask::MAX_MSG_TEXT + 40];
+    if (chatRecolorUrls(d.san_text, rc, sizeof rc)) { lv_label_set_recolor(tlbl, true); lv_label_set_text(tlbl, rc); }
+  }
   const lv_coord_t kInnerMaxW = kBubbleMaxW - 2 * kChatBubblePadH;
   lv_point_t txt_size;
   lv_txt_get_size(&txt_size, d.san_text, &g_font_12, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
@@ -28159,6 +28868,12 @@ static lv_coord_t chatVirtCreateBubble(LvChatPanel* p, int logical_i, int ring_i
   lv_obj_add_flag(bubble, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_add_event_cb(bubble, bubbleLongPressMenuCb, LV_EVENT_LONG_PRESSED,
                       reinterpret_cast<void*>(static_cast<intptr_t>(ring_idx)));
+  // A short tap on a bubble that carries a URL opens the Open-in-web / Create-QR menu
+  // (SHORT_CLICKED so it never double-fires with the long-press action menu). Failed
+  // outgoing sends keep their tap-to-resend.
+  if (has_url && !(m.outgoing && m.deliv_state == UITask::DELIV_FAILED))
+    lv_obj_add_event_cb(bubble, bubbleUrlTapCb, LV_EVENT_SHORT_CLICKED,
+                        reinterpret_cast<void*>(static_cast<intptr_t>(ring_idx)));
   // Failed sends keep the pre-virtualization one-tap resend (the compact path
   // already has it); the footer below spells the affordance out.
   if (m.outgoing && m.deliv_state == UITask::DELIV_FAILED)
@@ -32515,7 +33230,7 @@ static void openControlCenter() {
 enum AppDrawerAction {
   APPACT_CHATS, APPACT_CONTACTS, APPACT_MAP, APPACT_SETTINGS,
   APPACT_ADVERT, APPACT_POWER, APPACT_MENTIONS, APPACT_CMDCENTER, APPACT_SIGNAL,
-  APPACT_TERMINAL, APPACT_FILES, APPACT_MONITOR, APPACT_SPECTRUM, APPACT_SNAKE, APPACT_VNC, APPACT_REMOTE,
+  APPACT_TERMINAL, APPACT_FILES, APPACT_MONITOR, APPACT_SPECTRUM, APPACT_SNAKE, APPACT_VNC, APPACT_REMOTE, APPACT_READER,
 };
 
 static void closeAppDrawer() {
@@ -32764,6 +33479,9 @@ static void appTileCb(lv_event_t* e) {
     case APPACT_VNC:       openVncPage();        return;   // screen mirror + remote control from a browser
     case APPACT_REMOTE:    openRemotePage();     return;   // reboot into the web-resolution headless UI
 #endif
+#if defined(MULTI_TRANSPORT_COMPANION) && CAP_WEB_BROWSER
+    case APPACT_READER:    openReaderPage();     return;   // on-device text browser (no proxy)
+#endif
     case APPACT_ADVERT:    openAdvertModalCb(e);  return;
     case APPACT_POWER:     openPowerMenu();      return;
     case APPACT_SNAKE:     SnakeGame::launch();  return;
@@ -32861,6 +33579,43 @@ static void addAppTile(lv_obj_t* parent, int x, int y, int w, int h,
     lv_obj_set_style_bg_color(eye, lv_color_hex(0x0E1216), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(eye, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_set_style_radius(eye, 1, LV_PART_MAIN);
+  } else if (act == APPACT_READER) {
+    // 🌐 globe: the ONLY colour-emoji tile, so it drops to a tofu box on the 2 MB V4
+    // (the imgfont fallback can't decode it under PSRAM pressure). Draw it from a
+    // circle + meridian/parallel lines instead — renders identically on every board,
+    // same approach as the Snake tile above.
+    lv_obj_t* box = lv_obj_create(chip_o);
+    lv_obj_remove_style_all(box);
+    lv_obj_clear_flag(box, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_size(box, 22, 22);
+    lv_obj_center(box);
+    lv_obj_t* circ = lv_obj_create(box);        // outline sphere
+    lv_obj_remove_style_all(circ);
+    lv_obj_clear_flag(circ, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_size(circ, 22, 22);
+    lv_obj_set_pos(circ, 0, 0);
+    lv_obj_set_style_radius(circ, 11, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(circ, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_border_color(circ, lv_color_hex(icon_col), LV_PART_MAIN);
+    lv_obj_set_style_border_width(circ, 2, LV_PART_MAIN);
+    // meridians (longitude): straight centre + two curved sides; parallels (latitude):
+    // equator + one above + one below. Points are box-relative (0..22).
+    static const lv_point_t g_mc[] = {{11,0},{11,22}};
+    static const lv_point_t g_ml[] = {{11,1},{5,4},{2,11},{5,18},{11,21}};
+    static const lv_point_t g_mr[] = {{11,1},{17,4},{20,11},{17,18},{11,21}};
+    static const lv_point_t g_eq[] = {{0,11},{22,11}};
+    static const lv_point_t g_pt[] = {{4,6},{18,6}};
+    static const lv_point_t g_pb[] = {{4,16},{18,16}};
+    const struct { const lv_point_t* p; uint16_t n; } gl[] = {
+      {g_mc,2},{g_ml,5},{g_mr,5},{g_eq,2},{g_pt,2},{g_pb,2} };
+    for (auto& e : gl) {
+      lv_obj_t* l = lv_line_create(box);
+      lv_line_set_points(l, e.p, e.n);
+      lv_obj_set_pos(l, 0, 0);
+      lv_obj_set_style_line_color(l, lv_color_hex(icon_col), LV_PART_MAIN);
+      lv_obj_set_style_line_width(l, 1, LV_PART_MAIN);
+      lv_obj_set_style_line_rounded(l, true, LV_PART_MAIN);
+    }
   } else if (icon) {
     lv_obj_t* ic = lv_label_create(chip_o);
     lv_label_set_text(ic, icon);
@@ -33072,6 +33827,9 @@ static void openAppDrawer() {
     { LV_SYMBOL_IMAGE,     "VNC",       APPACT_VNC,      0,         0x6C7CF0 },      // browser screen-mirror indigo
     { LV_SYMBOL_WIFI,      "Remote",    APPACT_REMOTE,   0,         0x15B6A6 },      // headless web-resolution UI (brand teal)
 #endif
+#if defined(MULTI_TRANSPORT_COMPANION) && CAP_WEB_BROWSER
+    { "\xF0\x9F\x8C\x90",  "Web",       APPACT_READER,   0,         0x6FB7FF },      // on-device text browser (globe)
+#endif
     { nullptr,             "Signal",    APPACT_SIGNAL,   0,         COLOR_ACCENT },  // theme (drawn signal bars)
     { TOUCH_SYM_ANTENNA,   "Monitor",   APPACT_MONITOR,  0,         0x35C9C9 },      // RF monitor cyan
     { TOUCH_SYM_ANTENNA,   "Spectrum",  APPACT_SPECTRUM, 0,         0xE8A33D },      // RF spectrum analyzer amber
@@ -33192,6 +33950,15 @@ static void statusBarTapCb(lv_event_t* e) {
     return;
   }
   if (s_cc_root) closeControlCenter(); else openControlCenter();
+}
+
+// Reader/Web page back: fire on PRESSED (touch-DOWN), not CLICKED. The V4 cap-touch
+// swipe detector calls lv_indev_wait_release mid-tap and drops the bar's CLICKED (the
+// same reason the chat back uses PRESSED) — that's why the reader's "‹" tap "did
+// nothing". This closes the reader on touch-down whenever it's the open page.
+static void statusBarReaderBackCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_PRESSED) return;
+  if (s_reader_page_open && s_apppage_close) s_apppage_close();
 }
 
 // Capture the composited screen to a 16-bit BMP on the SD card. BMP (no
@@ -33447,6 +34214,7 @@ static void buildGlobalStatusBar() {
   // keypad users open the control center via the dedicated key.)
   lv_obj_add_flag(g_statusbar.root, NAV_SKIP_FLAG);
   lv_obj_add_event_cb(g_statusbar.root, statusBarTapCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_add_event_cb(g_statusbar.root, statusBarReaderBackCb, LV_EVENT_PRESSED, nullptr);  // reader "‹": PRESSED so cap-touch can't drop it
   // Hold the bar for 3 s to drop a screenshot to the SD card.
   lv_obj_add_event_cb(g_statusbar.root, statusBarHoldCb, LV_EVENT_PRESSED,    nullptr);
   lv_obj_add_event_cb(g_statusbar.root, statusBarHoldCb, LV_EVENT_PRESSING,   nullptr);
@@ -33743,11 +34511,18 @@ static void updateGlobalStatusBar() {
     // chevron + title) is covered by the page. Settings sheets sit on lv_scr_act so they
     // never need this.
     const bool want_fg = SnakeGame::isOpen() || (s_apppage_title != nullptr);
-    if (want_fg != s_bar_fg) {
-      s_bar_fg = want_fg;
-      if (want_fg) lv_obj_move_foreground(g_statusbar.root);
-      else         lv_obj_move_background(g_statusbar.root);
+    if (want_fg) {
+      // Keep the bar the TOPMOST lv_layer_top child so its back tap is always hittable —
+      // re-assert every tick (a page opened over a chat can otherwise let the chat's
+      // widgets sit above the bar's lower row). Only move when it isn't already on top,
+      // so this doesn't invalidate/redraw the bar each frame.
+      lv_obj_t* lt = lv_layer_top();
+      uint32_t n = lv_obj_get_child_cnt(lt);
+      if (n && lv_obj_get_child(lt, n - 1) != g_statusbar.root) lv_obj_move_foreground(g_statusbar.root);
+    } else if (s_bar_fg) {
+      lv_obj_move_background(g_statusbar.root);
     }
+    s_bar_fg = want_fg;
   }
 
   // ---- Modal scrim over the bar (edge-triggered) ----
@@ -33759,7 +34534,8 @@ static void updateGlobalStatusBar() {
   if (g_statusbar.dim) {
     static bool s_bar_dim = false;
     const bool want_dim = anyPopupOpen() && !s_cc_root && !s_settings_sheet &&
-                          !s_appdrawer_root && !chanScopeIsOpen() && !blockedModalIsOpen();
+                          !s_appdrawer_root && !chanScopeIsOpen() && !blockedModalIsOpen() &&
+                          !s_reader_page_open;   // the reader uses the bar for its ‹ back — don't dim/block it
     if (want_dim != s_bar_dim) {
       s_bar_dim = want_dim;
       if (want_dim) lv_obj_clear_flag(g_statusbar.dim, LV_OBJ_FLAG_HIDDEN);
@@ -33771,7 +34547,11 @@ static void updateGlobalStatusBar() {
   // The bar goes 2× tall for (a) settings detail pages, (b) the chat/channel OVERVIEW
   // (lower row = [+ ✓ QR] actions), and (c) an OPEN chat (lower row = thread name, cog
   // centred across both rows).
-  const bool chat_open      = (s_chat_title[0] != '\0');
+  // An open app/tool page (the reader, RF Monitor, …) takes over the bar even when a
+  // chat is still open underneath it, so suppress chat-mode chrome (the cog + back
+  // chevron + centred title) then — otherwise they sit over the page's "‹ title" and
+  // swallow its back tap.
+  const bool chat_open      = (s_chat_title[0] != '\0') && !s_apppage_title;
   const bool inbox_overview = (getActiveTab() == CHAT_INBOX_TAB_INDEX) && !chat_open && (s_settings_open_cat < 0) && !s_apppage_title;
   {
     const bool want_tall = (s_settings_open_cat >= 0) || s_apppage_title || inbox_overview || chat_open;
@@ -33783,7 +34563,7 @@ static void updateGlobalStatusBar() {
     // built state — opaque root + hidden fade — already matches the inactive case).
     // EXCEPT while the channel-settings / blocked-users sheets are open: those are a new
     // page over the chat, so the bar goes SOLID (no glass revealing the chat behind it).
-    const bool fade_active = want_tall && !chanScopeIsOpen() && !blockedModalIsOpen();
+    const bool fade_active = want_tall && !chanScopeIsOpen() && !blockedModalIsOpen() && !s_reader_page_open;
     static bool s_fade_active = false;
     if (fade_active != s_fade_active) {
       s_fade_active = fade_active;
@@ -33828,7 +34608,7 @@ static void updateGlobalStatusBar() {
 
   // Settings gear sits just left of the thread name in ANY open chat (channel →
   // scope + blocked users; DM → blocked users).
-  const bool in_chan_chat = (s_chat_title[0] != '\0');
+  const bool in_chan_chat = chat_open;   // already excludes an open app/tool page (see above)
   // Back chevron + settings cog on the far left while in a chat; both centred in the
   // tall bar (see the shift loop above). The cog is clickable (channel settings); the
   // back chevron is just an affordance — the bar's tap closes the chat.
@@ -33883,6 +34663,19 @@ static void updateGlobalStatusBar() {
   const char* app_page_title = s_apppage_title ? s_apppage_title
                              : (s_settings_open_cat >= 0) ? TR(kSettingsCats[s_settings_open_cat].label)
                              : nullptr;
+  if (app_page_title && s_reader_bar_url) {
+    // Web app, reading: show the loaded URL small so a long address fits, on a solid
+    // bar. No recolor markup (a '#' fragment in the URL would corrupt the parser) and
+    // strip the scheme for width — "‹ example.com/page".
+    const char* disp = app_page_title;
+    if      (!strncmp(disp, "https://", 8)) disp += 8;
+    else if (!strncmp(disp, "http://",  7)) disp += 7;
+    lv_obj_set_style_text_font(g_statusbar.left_label, &g_font_12, LV_PART_MAIN);
+    lv_label_set_recolor(g_statusbar.left_label, false);
+    char sbuf[96];
+    snprintf(sbuf, sizeof sbuf, "%s  %s", LV_SYMBOL_LEFT, disp);   // ‹ + address; tap the bar = back
+    lv_label_set_text(g_statusbar.left_label, sbuf);
+  } else
   if (app_page_title) {
     // A settings detail sheet OR a tool page is open: the bar carries its Back chevron +
     // page title, CENTRED in the tall bar and a size up (tapping the bar goes Back). The
@@ -34126,6 +34919,16 @@ static void updateGlobalStatusBar() {
   }
 #endif
 
+  // ---- Reader/Web page: hide the clock so the URL fits in the title zone ----
+  if (g_statusbar.clock) {
+    static bool s_clk_hidden = false;
+    if (s_reader_bar_url != s_clk_hidden) {
+      s_clk_hidden = s_reader_bar_url;
+      if (s_reader_bar_url) lv_obj_add_flag(g_statusbar.clock, LV_OBJ_FLAG_HIDDEN);
+      else                  lv_obj_clear_flag(g_statusbar.clock, LV_OBJ_FLAG_HIDDEN);
+    }
+  }
+
   // ---- Clock placement ----
   // With "hide device name" on, the clock sits CENTRED on every screen — clear of
   // both the left-zone title (chat / Files / map credit) and the right-side icon
@@ -34368,6 +35171,21 @@ static void refreshStatusLabels() {
   // tick if the user is somewhere else.
   if (active_tab == MAP_TAB_INDEX) { mapAutoFollowTick(); refreshMapInfoLabel(); }
 #if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+  // Reader (text browser): the fetch worker publishes text/status via s_reader_dirty.
+  // The page is a full-screen overlay (any tab), so gate on the page being open.
+  if (s_reader_dirty && s_reader_root) {
+    s_reader_dirty = false;
+    if (s_reader_status) lv_label_set_text(s_reader_status, s_reader_msg);
+    if (!s_reader_busy) {                   // the fetch finished
+      if (s_reader_ok) {                    // …with a page
+        readerRenderBody();
+        readerSetAddrExpanded(false);       // collapse the address bar -> fullscreen reading
+      } else {                              // …with an error — SHOW it (don't sit on "Loading…")
+        readerShowMessage(s_reader_msg[0] ? s_reader_msg : "Couldn't load page", 0xE0A0A0);
+        readerSetAddrExpanded(true);        // expand so the address bar + retry are reachable
+      }
+    }
+  }
   // Wi-Fi fetcher arrived a new tile — re-render the map so the freshly
   // downloaded tile appears. Only re-render if we're actually on the
   // map tab; otherwise let the next tab activation pick it up.
@@ -41226,6 +42044,8 @@ static constexpr uint8_t PF_COUNT = 1;
 static constexpr uint8_t PF_SWIPE = 2;
 #define P_OPEN(root) []{ return (root) != nullptr; }
 static const PopupEnt k_popup_registry[] = {
+  { P_OPEN(s_urlqr_root),            []{ closeUrlQr(); },                 PF_COUNT },   // chat URL -> QR
+  { P_OPEN(s_urlmenu_root),          []{ closeUrlMenu(); },               PF_COUNT },   // chat URL -> action menu
   { P_OPEN(s_meminfo_root),          []{ closeMemInfo(); },               PF_COUNT },
   { P_OPEN(s_monitor_root),          []{ closeMonitorPage(); },           PF_COUNT },
   { P_OPEN(s_spec_root),             []{ closeSpectrumPage(); },          PF_COUNT },
@@ -41269,6 +42089,7 @@ static const PopupEnt k_popup_registry[] = {
 #endif
 #if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
   { P_OPEN(s_wifi_sheet),            []{ wifiSheetClose(); },             PF_COUNT },   // was in no registry at all
+  { P_OPEN(s_reader_root),           []{ closeReaderPage(); },            PF_COUNT },   // on-device text browser
 #endif
 #if defined(HAS_TDECK_GT911)
   { P_OPEN(s_snd_menu),              []{ sndMenuClose(); },               PF_COUNT },   // was in no registry at all
