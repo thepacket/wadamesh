@@ -27604,8 +27604,12 @@ static void updatePagerEncoder(unsigned long now) {
     pagerNavGoBack();   // see pagerNavGoBack() above for the ladder + rationale
     s_long_fired = true;
   } else if (!held && s_was_held && !s_long_fired) {
-    if (s_accentnav_active) accentNavConfirm();          // picking an accent: confirm the highlighted one
-    else                    navPushTap(LV_KEY_ENTER);    // released before the long-press threshold -> short click
+    // Released before the long-press threshold -> short click, same as a
+    // keyboard Enter: on a focused chat bubble that means the per-message
+    // action menu (navEnterBubble), not a plain ENTER keypress -- mirrors
+    // handleHwKey()'s Enter branch exactly so both inputs agree.
+    if (s_accentnav_active)         accentNavConfirm();  // picking an accent: confirm the highlighted one
+    else if (!navEnterBubble())     navPushTap(LV_KEY_ENTER);
   }
   s_was_held = held;
 }
@@ -28804,12 +28808,13 @@ static void handleHwKey(int key) {
 #if defined(TLORA_PAGER)
     // No field is bound to the on-screen keyboard, so nav focus is on a plain
     // widget (button/switch/list row). Enter = the same "submit/click" the
-    // encoder's short click already sends via navPushTap(LV_KEY_ENTER) --
+    // encoder's short click also sends via navPushTap(LV_KEY_ENTER) --
     // works during the setup wizard too, matching encoder parity (hence
     // ahead of the s_setup_root check below). EXCEPT on a focused chat
     // bubble, which has no touch/trackball to long-press here -- Enter opens
     // the same Ack/Mention/Copy/Info/Block action menu instead (navEnterBubble,
-    // shared with Tanmatsu's identical Enter-on-bubble handling).
+    // shared with Tanmatsu's identical Enter-on-bubble handling, and with the
+    // encoder's own short click in updatePagerEncoder() -- both inputs agree).
     if (key == 0x0D) {
       if (!navEnterBubble()) navPushTap(LV_KEY_ENTER);
       if (g_lv.task) g_lv.task->noteUserInput();
