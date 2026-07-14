@@ -23,15 +23,16 @@ normally and these combos step out of the way.
 
 ## Rotary encoder
 
-| Gesture | Action |
-|---|---|
-| Turn | Move focus to the next/previous item on screen |
-| Short click | Select / confirm the focused item (same as Enter) |
-| Hold ~1 s, then release | **Back**: closes a popup → closes an open chat → goes Home → Esc (whichever applies first) |
-| **Fn (Alt) + turn**, on a main tab | Jump directly between the 5 main tabs (Chats / Contacts / Home / Map / Settings) |
-| **Fn (Alt) + turn**, inside a settings page or chat | Scroll the page up/down |
-| Turn, with a dropdown open | Scroll through the dropdown's options |
-| Turn, with the accent picker open | Cycle through the accent variants (see below) |
+| Gesture | Action | Keyboard equivalent |
+|---|---|---|
+| Turn | Move focus to the next/previous item on screen | **Fn (Alt) tapped alone** moves forward one step (NEXT only — no keyboard way to go backward) |
+| Short click | Select / confirm the focused item | **Enter** |
+| Hold ~1 s, then release | **Back**: closes a popup → closes an open chat → goes Home → Esc (whichever applies first) | **Backspace held ~1 s** |
+| **Fn (Alt) + turn**, on a main tab | Jump directly between the 5 main tabs (Chats / Contacts / Home / Map / Settings) | none — encoder only |
+| **Fn (Alt) + turn**, inside a settings page or chat | Scroll the page up/down | none — encoder only |
+| Turn, with a dropdown open | Scroll through the dropdown's options | none — encoder only |
+| Turn, with the accent picker open | Cycle through the accent variants (see below) | none — encoder only (Fn+Space to enter is shared) |
+| Turn, with the @-mention list open | Cycle through matching contacts (see below) | none — encoder only |
 
 The knob doubles as your only way to reach the bottom tab bar — since
 there's no touch to tap an icon, **Fn+turn** while on any main tab is the
@@ -148,9 +149,9 @@ dimmable brightness curve.
 
 | Input | Action |
 |---|---|
-| Turn encoder | Move focus |
-| Click encoder | Select / confirm |
-| Hold encoder ~1s | Back |
+| Turn encoder (or Fn tap = NEXT only) | Move focus |
+| Click encoder (or Enter) | Select / confirm |
+| Hold encoder ~1s (or hold Backspace ~1s) | Back |
 | Fn + turn (main tab) | Switch tabs |
 | Fn + turn (page/chat) | Scroll |
 | Fn tap alone | Next field |
