@@ -96,6 +96,18 @@ without touch:
 3. **Enter** — confirms your choice and replaces the letter you just typed.
 4. **Backspace** — dismisses the popup and keeps the plain letter.
 
+## @-mentions
+
+Typing `@` followed by a few letters of a contact's name pops up a matching
+list in a channel/group chat. Unlike the accent picker above, this one grabs
+the encoder **immediately** — no Fn+Space needed, since it only appears once
+you've deliberately started typing a mention:
+
+1. **Turn the encoder** — cycles through the matching contacts.
+2. **Enter / encoder click** — confirms the highlighted one, replacing
+   `@partial` with `@FullName ` in your message.
+3. **Backspace** — dismisses the list without touching what you typed.
+
 ## Sliders
 
 Any focused slider (Control Center brightness, a Settings slider, the Map
@@ -146,6 +158,7 @@ dimmable brightness curve.
 | Fn + Shift (editing a field) | Toggle Caps Lock |
 | Fn + Shift (not editing a field) | Jump to Home |
 | Fn + Space | Enter accent picker |
+| @ + letters (composer) | Auto-focuses the mention list — no Fn+Space needed |
 | Enter | Select / send / message action menu |
 | Backspace (tap) | Delete / jump to latest message |
 | Backspace (hold 1s) | Back, or unlock if locked |
