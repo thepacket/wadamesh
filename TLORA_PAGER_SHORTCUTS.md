@@ -65,9 +65,12 @@ Hold **Fn (Alt)** for numbers/symbols instead:
   Real momentary Shift, just like a normal keyboard.
 - **Hold Fn (Alt), then press Shift**: while you're editing a text field,
   toggles **Caps Lock** on/off — stays uppercase until you repeat the chord.
-  Anywhere else (not editing a field), the same chord instead jumps straight
-  to the **Home** screen.
+  Anywhere else (not editing a field), the chord does nothing.
 - Shift alone, tapped with nothing else, does nothing (as expected).
+- **Hold Fn (Alt), then press Backspace**: jumps straight to the **Home**
+  screen — works everywhere, including while you're actively editing a field
+  (unlike Alt+Shift above, this one isn't context-dependent). Doesn't delete
+  a character or trigger the plain-Backspace gestures below.
 
 ### Special keys
 
@@ -157,7 +160,8 @@ dimmable brightness curve.
 | Fn tap alone | Next field |
 | Hold Shift + letter | Momentary uppercase |
 | Fn + Shift (editing a field) | Toggle Caps Lock |
-| Fn + Shift (not editing a field) | Jump to Home |
+| Fn + Shift (not editing a field) | Nothing |
+| Fn + Backspace (anywhere) | Jump to Home |
 | Fn + Space | Enter accent picker |
 | @ + letters (composer) | Auto-focuses the mention list — no Fn+Space needed |
 | Enter | Select / send / message action menu |

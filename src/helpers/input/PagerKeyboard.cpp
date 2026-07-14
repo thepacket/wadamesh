@@ -41,15 +41,21 @@ static constexpr char s_symbolMap[KB_ROWS][KB_COLS] = {
 // Shift-key semantics) — held Alt THEN a Shift press instead chords into
 // Alt+Shift, reported via s_alt_shift_chord_pending. What that chord DOES is
 // a UI-level decision (UITask.cpp): Caps Lock toggle while editing a text
-// field, or jump Home otherwise — this driver has no idea which field (if
-// any) is focused, so it only reports the chord, it doesn't act on it (see
-// pagerKeyboardConsumeAltShiftChord()/pagerKeyboardToggleCaps()). Note: Alt
-// (row2,col0) and Shift (row2,col8) share row2, and row0/row1 col8 are
-// 'o'/'l' — holding Alt+Shift+O or Alt+Shift+L all three at once will
-// phantom-ghost a 'q'/'a' at the row2/col0 intersection (classic
-// diode-less-matrix 3-key rectangle, no software fix possible); harmless in
-// practice since the intended gesture is hold-Alt-tap-Shift-release-both,
-// not holding all three simultaneously.
+// field, no-op otherwise — this driver has no idea which field (if any) is
+// focused, so it only reports the chord, it doesn't act on it (see
+// pagerKeyboardConsumeAltShiftChord()/pagerKeyboardToggleCaps()). Held Alt
+// THEN a Backspace press similarly chords into Alt+Backspace
+// (s_alt_backspace_chord_pending) — unlike Alt+Shift this one has a single,
+// context-independent effect (jump Home, everywhere, including mid-edit),
+// so it's just as driver-agnostic to report but never conditional at the UI
+// layer. Note: Alt (row2,col0) and Shift (row2,col8) share row2, and
+// row0/row1 col8 are 'o'/'l' — holding Alt+Shift+O or Alt+Shift+L all three
+// at once will phantom-ghost a 'q'/'a' at the row2/col0 intersection
+// (classic diode-less-matrix 3-key rectangle, no software fix possible);
+// harmless in practice since the intended gesture is
+// hold-Alt-tap-Shift-release-both, not holding all three simultaneously.
+// Backspace (row2,col9) sits one column over from Shift, so Alt+Backspace
+// doesn't share this exact ghosting risk with any base-layer letter.
 static constexpr uint8_t kAltPos       = 2 * KB_COLS + 0; // row2,col0 ('\0' in both layers)
 static constexpr uint8_t kShiftPos     = 2 * KB_COLS + 8; // row2,col8 ('\0' in both layers)
 static constexpr uint8_t kBackspacePos = 2 * KB_COLS + 9; // row2,col9 ('\0' in both layers)
@@ -63,6 +69,7 @@ static bool s_alt_tap_pending = false;  // Alt pressed+released with nothing els
 static bool s_caps = false;
 static bool s_shift_held = false;   // momentary Shift, mirrors s_backspace_held/s_space_held
 static bool s_alt_shift_chord_pending = false;   // one-shot, see pagerKeyboardConsumeAltShiftChord()
+static bool s_alt_backspace_chord_pending = false;   // one-shot, see pagerKeyboardConsumeAltBackspaceChord()
 static bool s_backspace_held = false;
 static bool s_space_held = false;
 
@@ -128,7 +135,19 @@ void pagerKeyboardPoll() {
       }
       continue;
     }
-    if (code == kBackspacePos) { s_backspace_held = pressed; if (pressed) ringPush('\b'); continue; }
+    if (code == kBackspacePos) {
+      if (pressed) {
+        // Alt+Backspace is a distinct chord (jump Home, everywhere -- see
+        // pagerKeyboardConsumeAltBackspaceChord()), not a delete: suppress
+        // both the '\b' ring-push AND s_backspace_held, so the plain-
+        // Backspace hold gestures (back / unlock) never also see this press.
+        if (s_alt) s_alt_backspace_chord_pending = true;
+        else       { s_backspace_held = true; ringPush('\b'); }
+      } else {
+        s_backspace_held = false;
+      }
+      continue;
+    }
     if (code == kSpacePos) { s_space_held = pressed; if (pressed) ringPush(' '); continue; }
     if (!pressed) continue;   // base/symbol keys only emit on press
 
@@ -181,5 +200,11 @@ bool pagerKeyboardConsumeAltShiftChord() {
 }
 
 void pagerKeyboardToggleCaps() { s_caps = !s_caps; }
+
+bool pagerKeyboardConsumeAltBackspaceChord() {
+  if (!s_alt_backspace_chord_pending) return false;
+  s_alt_backspace_chord_pending = false;
+  return true;
+}
 
 #endif

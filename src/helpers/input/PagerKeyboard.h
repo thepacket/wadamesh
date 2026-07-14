@@ -56,10 +56,12 @@ void pagerKeyboardMarkAltUsed();
  *  symbol-layer or Alt+turn hold. Consumes the pending flag on read. */
 bool pagerKeyboardConsumeAltTap();
 
-/** True while Backspace is physically held (raw state, mirrors
- *  pagerKeyboardAltHeld()). A press still immediately ring-pushes '\b' as
- *  before; this is for callers that want to detect a long hold separately
- *  (e.g. UITask's press-and-hold "back" gesture). */
+/** True while Backspace is physically held WITHOUT Alt (raw state, mirrors
+ *  pagerKeyboardAltHeld()). A plain press still immediately ring-pushes '\b'
+ *  as before; this is for callers that want to detect a long hold separately
+ *  (e.g. UITask's press-and-hold "back" gesture). Alt+Backspace is a
+ *  different gesture entirely (see pagerKeyboardConsumeAltBackspaceChord())
+ *  and never sets this or ring-pushes '\b'. */
 bool pagerKeyboardBackspaceHeld();
 
 /** True while Space is physically held (raw state, mirrors
@@ -79,5 +81,13 @@ bool pagerKeyboardConsumeAltShiftChord();
 /** Toggle persistent Caps Lock. Callers gate this on the Alt+Shift chord
  *  above only applying while a text field is actually being edited. */
 void pagerKeyboardToggleCaps();
+
+/** One-shot: true exactly once after Alt(Fn)+Backspace is chorded (Backspace
+ *  pressed while Alt is held) — jumps Home, everywhere (editing a field or
+ *  not), unlike the Alt+Shift chord above. Suppresses the normal Backspace
+ *  press entirely: no '\b' ring-push, and pagerKeyboardBackspaceHeld() never
+ *  reports held for this press, so it can't also fire the plain-Backspace
+ *  hold-to-back/hold-to-unlock gestures. Consumes the pending flag on read. */
+bool pagerKeyboardConsumeAltBackspaceChord();
 
 #endif

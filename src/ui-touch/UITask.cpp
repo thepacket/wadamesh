@@ -31177,18 +31177,35 @@ static void updatePagerAltTapNext() {
 }
 
 // Alt(Fn)+Shift chord (PagerKeyboard.cpp only reports it, since the driver has
-// no UI visibility): while actually editing a text field, toggle Caps Lock
-// (the field is where "Caps Lock" means anything); everywhere else — no field
-// focused, or a field merely bound but nav focus has moved off it (same "ta"
-// derivation handleHwKey() uses) — jump straight Home instead, since Caps
-// Lock silently flipping with no field to see it in was reported as
-// surprising/purposeless outside of typing.
+// no UI visibility): toggles Caps Lock while actually editing a text field
+// (the field is where "Caps Lock" means anything) and is a deliberate no-op
+// everywhere else (Home-jump duty moved to Alt+Backspace below, so there's no
+// longer a reason to make this chord do anything outside a field — Caps Lock
+// silently flipping with no field to see it in was reported as
+// surprising/purposeless before this split).
 static void updatePagerAltShiftChord() {
   if (!pagerKeyboardConsumeAltShiftChord()) return;
   lv_obj_t* ta_focused = lv_keyboard_get_textarea(g_lv.keyboard);
   lv_obj_t* ta = (ta_focused && s_nav_group && lv_group_get_focused(s_nav_group) == ta_focused) ? ta_focused : nullptr;
-  if (ta) pagerKeyboardToggleCaps();
-  else    navGoToMainTab(HOME_TAB_INDEX);
+  if (!ta) return;
+  pagerKeyboardToggleCaps();
+  if (g_lv.task) g_lv.task->noteUserInput();
+}
+
+// Alt(Fn)+Backspace chord: jump straight Home, unconditionally -- unlike
+// Alt+Shift above, this one is NOT context-dependent (works whether or not a
+// field is being edited, per explicit request). Fires instead of a normal
+// Backspace press: PagerKeyboard.cpp suppresses the '\b' ring-push and the
+// hold-to-back/hold-to-unlock tracking entirely for an Alt-held Backspace
+// press, so there's no double-action to guard against here.
+static void updatePagerAltBackspaceChord() {
+  if (!pagerKeyboardConsumeAltBackspaceChord()) return;
+  // The accent/@-mention pickers live on lv_layer_top(), outside the tab
+  // content navGoToMainTab() switches away from -- close them explicitly
+  // first so a stray overlay doesn't keep floating over the Home screen.
+  accentBoxHide();
+  mentionBoxHide();
+  navGoToMainTab(HOME_TAB_INDEX);
   if (g_lv.task) g_lv.task->noteUserInput();
 }
 
@@ -42834,11 +42851,12 @@ void UITask::loop() {
       if (pagerKeyboardReadKey() <= 0) break;
       any = true;
     }
-    // Discard any Alt tap / Alt+Shift chord picked up while idle-dimmed -- it
-    // must not fire updatePagerAltTapNext()'s NEXT / updatePagerAltShiftChord()'s
-    // toggle-or-Home the instant the screen wakes.
+    // Discard any Alt tap / Alt+Shift / Alt+Backspace chord picked up while
+    // idle-dimmed -- none of them may fire (NEXT / Caps toggle / jump Home)
+    // the instant the screen wakes.
     pagerKeyboardConsumeAltTap();
     pagerKeyboardConsumeAltShiftChord();
+    pagerKeyboardConsumeAltBackspaceChord();
     // Hard-locked: an ordinary keypress must NOT wake/unlock -- only holding
     // Backspace does (updatePagerBackspaceUnlockHold, already polled above).
     if (any && !g_lv.task->isManualLock()) g_lv.task->wakeScreen();
@@ -42850,6 +42868,7 @@ void UITask::loop() {
     }
     updatePagerAltTapNext();
     updatePagerAltShiftChord();
+    updatePagerAltBackspaceChord();
     updatePagerBackspaceHold(now);
     updatePagerSpaceHold(now);
   }
