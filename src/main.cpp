@@ -177,6 +177,10 @@ MyMesh the_mesh(radio_driver, fast_rng, rtc_clock, tables, store
 #if defined(ESP32)
 volatile int g_boot_phase = 0;
 extern "C" void set_boot_phase(int phase) { g_boot_phase = phase; }
+// True once contacts/channels are actually routed to the SD card at boot (SD mounted). The
+// "Store data on SD" toggle is only a stored intent — if the card didn't mount at boot, contacts
+// silently stay on internal flash. The Storage settings page reads this to show the REAL location.
+bool g_contacts_on_sd = false;
 #endif
 
 
@@ -479,20 +483,32 @@ void setup() {
    #endif
     bool sd_mounted = false;
     if (_spi) {
-      // Try to mount the card on EVERY boot now (not just the full-adoption case):
-      // even a device that keeps identity on SPIFFS wants its churn-heavy
-      // contacts/channels on the card. Full 4-try ladder for the cold-card
-      // first-run adoption; a shorter 2-try for the contacts-overflow case so a
-      // card-less device only pays ~260 ms.
-      int tries = want_full_sd ? 4 : 2;
-      for (int a = 0; a < tries && !sd_mounted; ++a) {   // short mount ladder (cold cards)
+      // Try to mount the card on EVERY boot: even a device that keeps identity on SPIFFS
+      // wants its churn-heavy contacts/channels on the card.
+      //
+      // Use the SAME forgiving ladder the map-tile mount (fmSdTryMount) uses — dropping to
+      // 1 MHz then 400 kHz — not a fast 4 MHz-only ladder. A cold / cheap / slow-to-wake card
+      // fails a 4 MHz-only mount here but later succeeds the slow tile mount, so contacts got
+      // silently pushed back to SPIFFS *even though the toggle said SD and tiles worked* — then
+      // SPIFFS churn eventually lost them (gubbinsgalore's "100 repeaters gone overnight").
+      // Matching the tile ladder means contacts land on the card wherever tiles do. A card-less
+      // device still bails fast (3 quick tries at 4 MHz, ~480 ms); only a present-but-cold card
+      // walks down to the slow clocks. delay() feeds the task WDT, so the ~2.8 s worst case
+      // (present cold card only) doesn't trip it.
+      static const struct { uint16_t settle_ms; uint32_t hz; } kBootMount[] = {
+        {  40, 4000000 }, { 220, 4000000 }, { 220, 4000000 },
+        { 300, 1000000 }, { 450, 1000000 }, { 650,  400000 }, { 900, 400000 },
+      };
+      int tries = want_full_sd ? 7 : 3;
+      for (int a = 0; a < tries && !sd_mounted; ++a) {
         SD.end();
-        delay(a == 0 ? 40 : 220);
-        if (SD.begin(PIN_SD_CS, *_spi, 4000000, "/sd", 3) && SD.cardType() != CARD_NONE)
+        delay(kBootMount[a].settle_ms);
+        if (SD.begin(PIN_SD_CS, *_spi, kBootMount[a].hz, "/sd", 3) && SD.cardType() != CARD_NONE)
           sd_mounted = true;
       }
     }
     if (sd_mounted) {
+      g_contacts_on_sd = true;   // every branch below routes contacts/channels to the card
       if (want_full_sd) {
         // beta_36 upgrade heal: adopting the card while the LIVE data still sits
         // on SPIFFS (the pre-beta_36 "toggle ignored" state) must migrate FIRST,

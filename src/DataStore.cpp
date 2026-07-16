@@ -420,6 +420,23 @@ bool DataStore::savePrefs(const NodePrefs& _prefs, double node_lat, double node_
 }
 
 void DataStore::loadContacts(DataStoreHost* host) {
+#if defined(ESP32)
+  // Recover an atomic-save swap interrupted by power loss: if the live file is gone but the
+  // fully-written temp survives, adopt it. A temp alongside an intact live file is a stale
+  // leftover (save crashed after writing temp but before the swap) — keep live, drop temp.
+  {
+    FILESYSTEM* cfs = _getContactsChannelsFS();
+    char live[80], tmp[80];
+    if (_root[0]) { snprintf(live, sizeof live, "%s/contacts3", _root);
+                    snprintf(tmp,  sizeof tmp,  "%s/contacts3.tmp", _root); }
+    else          { strncpy(live, "/contacts3", sizeof live);
+                    strncpy(tmp,  "/contacts3.tmp", sizeof tmp); }
+    if (cfs->exists(tmp)) {
+      if (!cfs->exists(live)) cfs->rename(tmp, live);   // interrupted swap -> recover the temp
+      else                    cfs->remove(tmp);          // stale temp -> the live file wins
+    }
+  }
+#endif
 File file = openRead(_getContactsChannelsFS(), "/contacts3");
     if (file) {
       bool full = false;
@@ -462,8 +479,21 @@ void DataStore::saveContacts(DataStoreHost* host, bool (*filter)(const ContactIn
   // (FAT has no such GC); it matters most for card-less SPIFFS devices.
   WdtHeavyGuard _wdt;
 #endif
-  File file = openWrite(_getContactsChannelsFS(), "/contacts3");
+#if defined(ESP32)
+  // Write to a TEMP file and swap it in only after it is FULLY written, so a partial
+  // write — a multi-second SPIFFS GC stall or an SD hiccup mid-save — can never truncate
+  // the operator's live contact list. Without this, openWrite("/contacts3") truncates the
+  // real file up front, so any failed write permanently destroyed the list (the "lost all
+  // my repeaters overnight" report). Other platforms keep the direct write (LittleFS, and
+  // untested here). The swap + boot-recovery live after the write loop below.
+  const char* kContactsWriteTarget = "/contacts3.tmp";
+#else
+  const char* kContactsWriteTarget = "/contacts3";
+#endif
+  File file = openWrite(_getContactsChannelsFS(), kContactsWriteTarget);
+  bool wrote_ok = false;                     // true only if every record reached the file
   if (file) {
+    bool ok = true;                          // cleared on any short write (partial file)
     uint32_t idx = 0;
     ContactInfo c;
     uint8_t unused = 0;
@@ -478,7 +508,6 @@ void DataStore::saveContacts(DataStoreHost* host, bool (*filter)(const ContactIn
     uint8_t* buf = (uint8_t*)malloc(REC * CHUNK_RECS);
     if (buf) {
       size_t fill = 0;
-      bool ok = true;
       while (ok && host->getContactForSave(idx, c)) {
         if (filter && !filter(c)) {
           idx++;  // advance to next contact
@@ -504,7 +533,7 @@ void DataStore::saveContacts(DataStoreHost* host, bool (*filter)(const ContactIn
         }
         idx++;  // advance to next contact
       }
-      if (ok && fill > 0) file.write(buf, fill);
+      if (ok && fill > 0) ok = (file.write(buf, fill) == fill);
       free(buf);
     } else {
       while (host->getContactForSave(idx, c)) {
@@ -525,13 +554,32 @@ void DataStore::saveContacts(DataStoreHost* host, bool (*filter)(const ContactIn
         success = success && (file.write((uint8_t *)&c.gps_lat, 4) == 4);
         success = success && (file.write((uint8_t *)&c.gps_lon, 4) == 4);
 
-        if (!success) break; // write failed
+        if (!success) { ok = false; break; } // write failed -> keep the live file
 
         idx++;  // advance to next contact
       }
     }
     file.close();
+    wrote_ok = ok;
   }
+#if defined(ESP32)
+  // Commit the temp only if it was written IN FULL; otherwise keep the existing live list.
+  // (_rp uses one shared buffer, so build both paths explicitly to avoid clobbering it.)
+  {
+    FILESYSTEM* cfs = _getContactsChannelsFS();
+    char live[80], tmp[80];
+    if (_root[0]) { snprintf(live, sizeof live, "%s/contacts3", _root);
+                    snprintf(tmp,  sizeof tmp,  "%s/contacts3.tmp", _root); }
+    else          { strncpy(live, "/contacts3", sizeof live);
+                    strncpy(tmp,  "/contacts3.tmp", sizeof tmp); }
+    if (wrote_ok) {
+      cfs->remove(live);          // FAT/SPIFFS rename won't overwrite an existing target
+      cfs->rename(tmp, live);     // if this rename fails, loadContacts recovers the temp at next boot
+    } else {
+      cfs->remove(tmp);           // discard the partial temp; the live contact list is untouched
+    }
+  }
+#endif
 }
 
 void DataStore::loadChannels(DataStoreHost* host) {

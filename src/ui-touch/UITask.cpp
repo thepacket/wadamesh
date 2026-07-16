@@ -406,6 +406,14 @@ extern "C" const lv_font_t zoom_font;
 // the battery-chart sleep markers will use g_font_14).
 extern "C" const lv_font_t sleepicons_font;
 #define TOUCH_SYM_MOON "\xEF\x86\x86"   /* U+F186 moon */
+// FontAwesome lock (U+F023) + bell (U+F0F3) + bell-slash (U+F1F6), 16 px — for the
+// control-center chips (real lock instead of an eye; a dynamic bell that gains a slash
+// when notifications are silenced). Own font (scripts-generated from fa-solid-900),
+// spliced into the g_font_16 fallback chain like person_font/zoom_font.
+extern "C" const lv_font_t cc_icons_16;
+#define TOUCH_SYM_LOCK       "\xEF\x80\xA3"   /* U+F023 lock */
+#define TOUCH_SYM_BELL       "\xEF\x83\xB3"   /* U+F0F3 bell (notifications on) */
+#define TOUCH_SYM_BELL_SLASH "\xEF\x87\xB6"   /* U+F1F6 bell-slash (silenced) */
 
 // Extras fallback fonts — em-dash (U+2014), ellipsis (U+2026), middle dot
 // (U+00B7). LVGL's stock Montserrat subset doesn't include these, so any
@@ -566,6 +574,13 @@ static void initTouchFontFallbacks() {
   s_person_font = person_font;
   s_person_font.fallback = g_font_16.fallback;
   g_font_16.fallback = &s_person_font;
+  // Control-center glyphs (lock / bell / bell-slash): splice onto the HEAD of
+  // g_font_16's chain too, so the CC chips (which render their icon in g_font_16)
+  // resolve U+F023/F0F3/F1F6. Chain: montserrat_16 -> cc_icons -> person -> [emoji] -> extras.
+  static lv_font_t s_cc_icons_font;
+  s_cc_icons_font = cc_icons_16;
+  s_cc_icons_font.fallback = g_font_16.fallback;
+  g_font_16.fallback = &s_cc_icons_font;
 #if CAP_LARGE_SCREEN
   // The fixed-size tab bar font needs the person glyph too (Contacts tab icon, U+F007) at 16 px.
   static lv_font_t s_tab_person; s_tab_person = person_font; s_tab_person.fallback = nullptr;
@@ -1160,6 +1175,7 @@ struct GlobalStatusBar {
   lv_obj_t* conn_icon;       // Wi-Fi glyph
   lv_obj_t* ble_icon;        // Bluetooth glyph (separate from Wi-Fi)
   lv_obj_t* sleep_icon;      // idle light-sleep readiness indicator (T-Deck only)
+  lv_obj_t* dnd_icon;        // Do Not Disturb active glyph (moon, all boards)
   lv_obj_t* sd_icon;         // microSD read/write activity LED (left of Wi-Fi)
   lv_obj_t* async_icon;      // async mesh-request spinner glyph (centre, transient)
   lv_obj_t* clock;
@@ -7390,6 +7406,64 @@ static void toggleGpsCb(lv_event_t* e) {   // GPS on/off switch (VALUE_CHANGED)
   refreshStatusLabels();
 }
 
+// Do Not Disturb: true while the current local time falls inside the configured
+// start/end window (30-min slots, may wrap past midnight). Unconditional (not
+// board-gated) so both the sound chokepoint and the status-bar icon code can call
+// it on every board. Silently inactive if the RTC hasn't been set yet.
+static bool dndActive() {
+  if (!touchPrefsGetDndEnabled()) return false;
+  time_t now_t = time(nullptr);
+  if (now_t <= 1700000000) return false;   // RTC not set yet -- clock is meaningless
+  struct tm tm_loc; localtime_r(&now_t, &tm_loc);
+  const int t     = tm_loc.tm_hour * 60 + tm_loc.tm_min;
+  const int start = (int)touchPrefsGetDndStartSlot() * 30;
+  const int end   = (int)touchPrefsGetDndEndSlot()   * 30;
+  // start == end -> zero-length window, always false here (never active).
+  return (start <= end) ? (t >= start && t < end) : (t >= start || t < end);
+}
+
+// Do Not Disturb master switch (under the Sound settings section). Stays silent
+// on toggle (no preview chime) since the whole point of DND is not making noise.
+static void toggleDndCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  const bool on = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+  touchPrefsSetDndEnabled(on);
+  refreshStatusLabels();
+}
+
+static lv_obj_t* s_dnd_start_lbl = nullptr;
+static lv_obj_t* s_dnd_end_lbl   = nullptr;
+
+static void dndFmtSlot(char* out, size_t out_sz, uint8_t slot) {
+  snprintf(out, out_sz, "%02u:%02u", slot / 2, (unsigned)(slot % 2) * 30);
+}
+static void dndStartLabelRefresh() {
+  if (!s_dnd_start_lbl) return;
+  char b[8]; dndFmtSlot(b, sizeof b, touchPrefsGetDndStartSlot());
+  lv_label_set_text(s_dnd_start_lbl, b);
+}
+static void dndEndLabelRefresh() {
+  if (!s_dnd_end_lbl) return;
+  char b[8]; dndFmtSlot(b, sizeof b, touchPrefsGetDndEndSlot());
+  lv_label_set_text(s_dnd_end_lbl, b);
+}
+static void dndStartStep(int delta) {
+  int s = ((int)touchPrefsGetDndStartSlot() + delta + 48) % 48;
+  touchPrefsSetDndStartSlot((uint8_t)s);
+  dndStartLabelRefresh();
+  refreshStatusLabels();
+}
+static void dndEndStep(int delta) {
+  int s = ((int)touchPrefsGetDndEndSlot() + delta + 48) % 48;
+  touchPrefsSetDndEndSlot((uint8_t)s);
+  dndEndLabelRefresh();
+  refreshStatusLabels();
+}
+static void dndStartMinusCb(lv_event_t* e) { if (lv_event_get_code(e) == LV_EVENT_CLICKED) dndStartStep(-1); }
+static void dndStartPlusCb(lv_event_t* e)  { if (lv_event_get_code(e) == LV_EVENT_CLICKED) dndStartStep(+1); }
+static void dndEndMinusCb(lv_event_t* e)   { if (lv_event_get_code(e) == LV_EVENT_CLICKED) dndEndStep(-1); }
+static void dndEndPlusCb(lv_event_t* e)    { if (lv_event_get_code(e) == LV_EVENT_CLICKED) dndEndStep(+1); }
+
 static void toggleBuzzerCb(lv_event_t* e) {   // message-sound switch (VALUE_CHANGED)
   if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED || !g_lv.task) return;
   g_lv.task->toggleBuzzer();
@@ -10991,6 +11065,67 @@ static void buildDeviceSettings(int sec) {
     lv_obj_add_event_cb(sw, toggleMentionSoundCb, LV_EVENT_VALUE_CHANGED, nullptr);
     y += LV_MAX(34, rh + 12);
   }
+  // Do Not Disturb — silences the incoming-message chime during a configured
+  // daily window (wraps past midnight; see dndActive()). Doesn't affect chat
+  // bubbles/badges, and the per-event switches above still preview audibly.
+  {
+    int rh = settingsRowLabel(body, y, 6, TR("Do Not Disturb"), COLOR_SUB, nullptr, 56);
+    lv_obj_t* sw = lv_switch_create(body);
+    lv_obj_align(sw, LV_ALIGN_TOP_RIGHT, 0, y);
+    if (touchPrefsGetDndEnabled()) lv_obj_add_state(sw, LV_STATE_CHECKED);
+    lv_obj_add_event_cb(sw, toggleDndCb, LV_EVENT_VALUE_CHANGED, nullptr);
+    y += LV_MAX(34, rh + 12);
+  }
+  {
+    y += settingsRowLabel(body, y, 0, TR("Start time"), COLOR_SUB, &g_font_12, 0) + 2;
+    lv_obj_t* bminus = lv_btn_create(body);
+    lv_obj_set_size(bminus, SC(50), SC(34));
+    lv_obj_set_pos(bminus, 2, y);
+    styleButton(bminus);
+    lv_obj_add_event_cb(bminus, dndStartMinusCb, LV_EVENT_CLICKED, nullptr);
+    { lv_obj_t* l = lv_label_create(bminus); lv_label_set_text(l, "-30m"); lv_obj_center(l); }
+
+    s_dnd_start_lbl = lv_label_create(body);
+    lv_obj_set_width(s_dnd_start_lbl, 100);
+    lv_obj_set_style_text_align(s_dnd_start_lbl, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_set_style_text_color(s_dnd_start_lbl, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+    lv_obj_set_style_text_font(s_dnd_start_lbl, &g_font_16, LV_PART_MAIN);
+    lv_obj_set_pos(s_dnd_start_lbl, 58, y + 9);
+    dndStartLabelRefresh();
+
+    lv_obj_t* bplus = lv_btn_create(body);
+    lv_obj_set_size(bplus, SC(50), SC(34));
+    lv_obj_set_pos(bplus, 168, y);
+    styleButton(bplus);
+    lv_obj_add_event_cb(bplus, dndStartPlusCb, LV_EVENT_CLICKED, nullptr);
+    { lv_obj_t* l = lv_label_create(bplus); lv_label_set_text(l, "+30m"); lv_obj_center(l); }
+    y += SC(42);
+  }
+  {
+    y += settingsRowLabel(body, y, 0, TR("End time"), COLOR_SUB, &g_font_12, 0) + 2;
+    lv_obj_t* bminus = lv_btn_create(body);
+    lv_obj_set_size(bminus, SC(50), SC(34));
+    lv_obj_set_pos(bminus, 2, y);
+    styleButton(bminus);
+    lv_obj_add_event_cb(bminus, dndEndMinusCb, LV_EVENT_CLICKED, nullptr);
+    { lv_obj_t* l = lv_label_create(bminus); lv_label_set_text(l, "-30m"); lv_obj_center(l); }
+
+    s_dnd_end_lbl = lv_label_create(body);
+    lv_obj_set_width(s_dnd_end_lbl, 100);
+    lv_obj_set_style_text_align(s_dnd_end_lbl, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_set_style_text_color(s_dnd_end_lbl, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+    lv_obj_set_style_text_font(s_dnd_end_lbl, &g_font_16, LV_PART_MAIN);
+    lv_obj_set_pos(s_dnd_end_lbl, 58, y + 9);
+    dndEndLabelRefresh();
+
+    lv_obj_t* bplus = lv_btn_create(body);
+    lv_obj_set_size(bplus, SC(50), SC(34));
+    lv_obj_set_pos(bplus, 168, y);
+    styleButton(bplus);
+    lv_obj_add_event_cb(bplus, dndEndPlusCb, LV_EVENT_CLICKED, nullptr);
+    { lv_obj_t* l = lv_label_create(bplus); lv_label_set_text(l, "+30m"); lv_obj_center(l); }
+    y += SC(42);
+  }
 #if CAP_SOUND_FILES   // WAV notification-sound rows (file-browsing sound picker, SD or SPIFFS)
   // Per-event notification sound files. Each slot: built-in chime, or a 16-bit
   // PCM WAV from /sounds/ (internal) or the SD card. Empty = built-in.
@@ -11252,6 +11387,32 @@ static void buildDeviceSettings(int sec) {
     lv_obj_add_event_cb(sw, useSdStorageToggleCb, LV_EVENT_VALUE_CHANGED, nullptr);
     y += LV_MAX(40, h + 12);
   }
+#if defined(HAS_TDECK_GT911) || defined(HELTEC_LORA_V4_R8)
+  /* Where contacts ACTUALLY live this boot. The toggle above is only an intent — if the
+     card failed to mount at boot (cold/slow card), contacts silently stay on internal flash
+     even with it ON. This line shows the truth and flags that mismatch. */
+  {
+    extern bool g_contacts_on_sd;
+    const bool want_sd = touchPrefsGetUseSdStorage();
+    lv_obj_t* st = lv_label_create(body);
+    lv_label_set_long_mode(st, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(st, lv_pct(96));
+    lv_obj_set_style_text_font(st, &g_font_12, LV_PART_MAIN);
+    lv_obj_set_pos(st, 0, y);
+    if (g_contacts_on_sd) {
+      lv_label_set_text(st, TR("Contacts are saved to the SD card."));
+      lv_obj_set_style_text_color(st, lv_color_hex(COLOR_STATUS_OK), LV_PART_MAIN);
+    } else if (want_sd) {
+      lv_label_set_text(st, TR("Contacts are on internal flash - the SD card did not mount at boot. Re-seat the card and reboot."));
+      lv_obj_set_style_text_color(st, lv_color_hex(0xE3A127), LV_PART_MAIN);  // amber warning
+    } else {
+      lv_label_set_text(st, TR("Contacts are on internal flash."));
+      lv_obj_set_style_text_color(st, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+    }
+    lv_obj_update_layout(st);
+    y += lv_obj_get_height(st) + SC(10);
+  }
+#endif
   /* Recovery for the beta_36 "lost my profile" upgrades: the live data was
      orphaned on internal flash when the honored SD toggle adopted an empty (or
      fresh-identity) card. This copies EVERYTHING from internal flash over the
@@ -24332,7 +24493,9 @@ static void renderMapTiles() {
   } else
 #endif
   if (!s_tiles_fs_ready) {
-#if defined(HAS_TDECK_GT911)
+#if defined(HAS_TDECK_GT911) || defined(TLORA_PAGER)
+    // Pager included: under the launcher there's no "tiles" partition, so point the user at the
+    // microSD fallback rather than the (launcher-wrong) "reflash the tiles partition" advice.
     if (SD.cardType() != CARD_NONE)
       lv_label_set_text(s_map_status_lbl,
           TR("Map storage error.\n\nSD card detected but the\ntile cache didn't mount.\nReboot to retry."));
@@ -33854,6 +34017,9 @@ static void ccKbBacklightCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
   s_kb_bl_mode = (uint8_t)((s_kb_bl_mode + 1) % 3);   // off -> on -> auto -> off
   touchPrefsSetKbBacklight(s_kb_bl_mode);
+  if (g_lv.task) g_lv.task->showAlert(s_kb_bl_mode == 0 ? TR("Keyboard light off")
+                                    : s_kb_bl_mode == 1 ? TR("Keyboard light on")
+                                                        : TR("Keyboard light auto"), 800);
   openControlCenter();   // rebuild so the chip label reflects the new mode
 }
 #endif
@@ -33881,6 +34047,7 @@ static void ccSoundCb(lv_event_t* e) {
     uiPlayNotify();
 #endif
   }
+  g_lv.task->showAlert(quiet ? TR("Sound off") : TR("Sound on"), 800);
   openControlCenter();   // rebuild so the chip's active state updates
 }
 #endif
@@ -34057,33 +34224,68 @@ static void ccLongNavCb(lv_event_t* e) {
   openSettingsCategory(cat);
   s_settings_from_cc = true;   // Back from here reopens the dropdown, not Home
 }
+// Do Not Disturb quick-toggle (control center). Flips the scheduled-silence master switch
+// (the time window lives in Settings > Sound, added with the DND feature); the chip's bell
+// gains a slash while DND is on. All boards — DND itself isn't board-gated.
+static void ccDndCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  const bool now_on = !touchPrefsGetDndEnabled();
+  touchPrefsSetDndEnabled(now_on);
+  if (g_lv.task) g_lv.task->showAlert(now_on ? TR("Do Not Disturb on") : TR("Do Not Disturb off"), 800);
+  refreshStatusLabels();   // update the status-bar DND bell right away
+  openControlCenter();     // rebuild so the chip's icon + highlight flip
+}
+
 static void ccToggle(lv_obj_t* parent, const char* sym, const char* label,
                      bool active, lv_event_cb_t cb, int width = 66, int height = 54,
-                     int long_cat = -1) {
-  lv_obj_t* b = lv_btn_create(parent);
-  lv_obj_set_size(b, width, height);
+                     int long_cat = -1, const char* sub_text = nullptr) {
+  (void)label;   // icon-only round chips now — the standalone caption under each icon was dropped by request
+  // A true circle needs a SQUARE footprint (LV_RADIUS_CIRCLE on a non-square gives a stadium/pill),
+  // so the visible button is d x d. But a bare d-wide circle is much narrower than its intended
+  // "width" slot, so the flex row would greedily pack too many per line (e.g. 7 tiny circles across
+  // the T-Deck instead of 4). Fix: give the flex row a full width x height TRANSPARENT CELL as the
+  // item, and centre the circle inside it. Now the row packs the intended count per line (4 on the
+  // T-Deck -> two rows of 4) and SPACE_EVENLY distributes those cells across the dropdown's width.
+  const int d = LV_MIN(width, height);
+  lv_obj_t* cell = lv_obj_create(parent);
+  lv_obj_remove_style_all(cell);
+  lv_obj_set_size(cell, width, height);
+  lv_obj_clear_flag(cell, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_t* b = lv_btn_create(cell);
+  lv_obj_set_size(b, d, d);
+  lv_obj_center(b);
   styleButton(b);
-  lv_obj_set_style_radius(b, 10, LV_PART_MAIN);
-  lv_obj_set_style_pad_all(b, 0, LV_PART_MAIN);   // reclaim the chip's inner area for the icon+label stack
+  lv_obj_set_style_radius(b, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(b, 0, LV_PART_MAIN);
+  // Kill the default theme's press "grow" (+3px each side): the circle sits flush inside its
+  // cell, so growing it on press just overflowed and got clipped — the "cuts off, looks weird"
+  // effect. Press feedback stays via styleButton's brighter pressed fill.
+  lv_obj_set_style_transform_width(b, 0, LV_PART_MAIN | LV_STATE_PRESSED);
+  lv_obj_set_style_transform_height(b, 0, LV_PART_MAIN | LV_STATE_PRESSED);
   // Follow the theme accent: solid when on, faint when off (was a fixed green when on).
   lv_obj_set_style_bg_color(b, lv_color_hex(COLOR_ACCENT), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(b, active ? LV_OPA_COVER : LV_OPA_20, LV_PART_MAIN);
   lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, nullptr);
   if (long_cat >= 0)   // long-press jumps to this feature's full settings page
     lv_obj_add_event_cb(b, ccLongNavCb, LV_EVENT_LONG_PRESSED, (void*)(intptr_t)long_cat);
-  // Icon over label, both pinned with a fixed gap so they never collide even on
-  // the shorter (44 px) T-Deck chips. Icon ~4 px from the top, label ~3 px from
-  // the bottom.
   lv_obj_t* ic = lv_label_create(b);
   lv_label_set_text(ic, sym);
-  lv_obj_set_style_text_font(ic, &g_font_16, LV_PART_MAIN);
   lv_obj_set_style_text_color(ic, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
-  lv_obj_align(ic, LV_ALIGN_TOP_MID, 0, 4);
-  lv_obj_t* l = lv_label_create(b);
-  lv_label_set_text(l, TR(label));
-  lv_obj_set_style_text_font(l, &g_font_12, LV_PART_MAIN);
-  lv_obj_set_style_text_color(l, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
-  lv_obj_align(l, LV_ALIGN_BOTTOM_MID, 0, -3);
+  if (sub_text && sub_text[0]) {
+    // Glyph + a small caption word stacked inside the circle (the keyboard chip keeps its
+    // off/on/auto mode visible under the keyboard icon). Shrink the glyph a touch to make room.
+    lv_obj_set_style_text_font(ic, &g_font_14, LV_PART_MAIN);
+    lv_obj_align(ic, LV_ALIGN_TOP_MID, 0, d <= 42 ? 2 : 6);
+    lv_obj_t* st = lv_label_create(b);
+    lv_label_set_text(st, sub_text);
+    lv_obj_set_style_text_font(st, &g_font_12, LV_PART_MAIN);
+    lv_obj_set_style_text_color(st, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+    lv_obj_align(st, LV_ALIGN_BOTTOM_MID, 0, d <= 42 ? -1 : -5);
+  } else {
+    // Just the icon, centred.
+    lv_obj_set_style_text_font(ic, &g_font_16, LV_PART_MAIN);
+    lv_obj_center(ic);
+  }
 }
 
 // ---- Display backlight brightness (PWM on PIN_TFT_LEDA_CTL, active-high) ----
@@ -34276,7 +34478,11 @@ static void openControlCenter() {
   lv_obj_set_size(s_cc_root, sw, sh - STATUSBAR_H);
   lv_obj_set_pos(s_cc_root, 0, STATUSBAR_H);
   lv_obj_set_style_bg_color(s_cc_root, lv_color_black(), LV_PART_MAIN);
-  lv_obj_set_style_bg_opa(s_cc_root, LV_OPA_50, LV_PART_MAIN);
+  // Darker scrim behind the glass panel. A true backdrop BLUR isn't feasible live on the
+  // ESP32 (no GPU; a per-frame gaussian would wreck the framerate), so instead heavily mute
+  // the screen behind the translucent card — that keeps the panel's own content crisp/readable
+  // while the card fill stays see-through enough to still read as glass.
+  lv_obj_set_style_bg_opa(s_cc_root, LV_OPA_70, LV_PART_MAIN);
   lv_obj_clear_flag(s_cc_root, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_move_foreground(s_cc_root);
   lv_obj_add_event_cb(s_cc_root, ccBackdropCb, LV_EVENT_CLICKED, nullptr);
@@ -34311,9 +34517,13 @@ static void openControlCenter() {
 #endif
   lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 4);
   lv_obj_set_style_bg_color(card, lv_color_hex(COLOR_PANEL), LV_PART_MAIN);
-  lv_obj_set_style_bg_opa(card, LV_OPA_COVER, LV_PART_MAIN);
+  // Frosted-glass panel: translucent fill so the (dimmed) screen behind shows through.
+  // Only the panel BACKGROUND is see-through — the clock/sliders/chips drawn on top stay
+  // fully opaque, so nothing becomes hard to read. ~85% keeps it clearly a solid surface.
+  lv_obj_set_style_bg_opa(card, 218, LV_PART_MAIN);
   lv_obj_set_style_radius(card, 12, LV_PART_MAIN);
-  lv_obj_set_style_border_color(card, lv_color_hex(0x18191A), LV_PART_MAIN);
+  // Subtle light hairline (instead of the near-black border) reads more like a glass edge.
+  lv_obj_set_style_border_color(card, lv_color_hex(0x3A3D42), LV_PART_MAIN);
   lv_obj_set_style_border_width(card, 1, LV_PART_MAIN);
   lv_obj_set_style_pad_all(card, 10, LV_PART_MAIN);
   lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
@@ -34563,11 +34773,9 @@ static void openControlCenter() {
 #elif defined(HAS_TDECK_GT911) || defined(HAS_THINKNODE_M9)
   tw = 58; th = 36;
 #else
-  // Count only the chips this board/session will actually add below, so the
-  // width doesn't assume a fixed chip count -- which chips appear varies per
-  // board (V4 has no Keyboard chip; only HAS_UI_SOUND boards get a Sound
-  // chip), so a hardcoded divisor silently overflows this row and wraps
-  // extra chips onto a clipped 2nd line under the fixed 54px height.
+  // Count only the chips this board/session will actually add below (which chips
+  // appear varies per board: V4 has no Keyboard chip; only HAS_UI_SOUND boards get
+  // a Sound chip), so the width divisor matches the real count.
   int chip_count = 2;   // Wi-Fi, Theme always shown
   if (!g_lv.task || g_lv.task->hasBleCapability()) chip_count++;   // BT
   chip_count++;   // GPS (toggle or info-only, always shown)
@@ -34577,8 +34785,27 @@ static void openControlCenter() {
 #if defined(HAS_UI_SOUND) || defined(HAS_TANMATSU)
   chip_count++;
 #endif
-  tw = (card_w - 20 - 5 * (chip_count - 1)) / chip_count;   // 5px gap, matches row's pad_column above
-  if (tw > 76) tw = 76;
+  chip_count++;   // Do Not Disturb (all boards)
+  if (portrait && chip_count >= 5) {
+    // Portrait screens (e.g. the V4) have vertical room below the GPS line, so lay 5+ chips
+    // out as TWO rows instead of one cramped row. The row is bottom-anchored and grows
+    // UPWARD, so its height MUST be capped to the gap below the GPS/env text — the first
+    // attempt hard-coded 58px circles, which climbed up and covered the GPS line.
+    const int per_row = (chip_count + 1) / 2;                 // 6 -> 3 per row, 5 -> 3 then 2
+    tw = (card_w - 20 - 5 * (per_row - 1)) / per_row;
+    if (tw > 92) tw = 92;
+    int rowh = 196 - (gps_y + 38);                            // row bottom (216 content − 20) up to just below GPS/env
+    if (rowh > 116) rowh = 116;
+    th = (rowh - 8) / 2;                                      // two rows + an 8px inter-row gap
+    if (th > 52) th = 52;
+    if (th < 34) th = 34;
+    lv_obj_set_style_pad_row(row, 8, LV_PART_MAIN);
+    lv_obj_set_height(row, th * 2 + 8);
+    lv_obj_align(row, LV_ALIGN_BOTTOM_MID, 0, -20);           // re-anchor after the resize
+  } else {
+    tw = (card_w - 20 - 5 * (chip_count - 1)) / chip_count;   // single row, fit all across
+    if (tw > 76) tw = 76;
+  }
 #endif
   // Each chip: tap = toggle, long-press = jump to that feature's settings page
   // (GPS -> Radio & Mesh, where the location-sharing settings live).
@@ -34592,18 +34819,25 @@ static void openControlCenter() {
 #endif
   ccToggle(row, LV_SYMBOL_TINT, "Theme", false, ccThemeCb, tw, th, CAT_DISPLAY);
 #if CAP_KEYBOARD
-  ccToggle(row, LV_SYMBOL_KEYBOARD,
-           s_kb_bl_mode == 0 ? "off" : (s_kb_bl_mode == 1 ? "on" : "auto"),
-           s_kb_bl_mode != 0, ccKbBacklightCb, tw, th, CAT_KEYBOARD);
+  // Keyboard-backlight chip: the keyboard glyph WITH its off/on/auto mode word beneath it,
+  // so the mode stays visible at a glance (sub_text stacks a small caption under the icon).
+  const char* kb_mode = s_kb_bl_mode == 0 ? "off" : (s_kb_bl_mode == 1 ? "on" : "auto");
+  ccToggle(row, LV_SYMBOL_KEYBOARD, "Keyboard", s_kb_bl_mode != 0, ccKbBacklightCb, tw, th, CAT_KEYBOARD, kb_mode);
 #endif
 #if defined(HAS_TDECK_GT911)
-  ccToggle(row, LV_SYMBOL_EYE_OPEN, "Lock", false, ccLockCb, tw, th, CAT_LOCK);
+  ccToggle(row, TOUCH_SYM_LOCK, "Lock", false, ccLockCb, tw, th, CAT_LOCK);   // real padlock, not an eye
 #endif
 #if defined(HAS_UI_SOUND) || defined(HAS_TANMATSU)
-  // Sound on/off (notification tones — T-Deck I2S speaker / Heltec V4 piezo / Tanmatsu ES8156).
+  // Sound on/off — the notification-tone mute (T-Deck I2S speaker / Heltec V4 piezo / Tanmatsu ES8156).
   const bool sound_on = g_lv.task && !g_lv.task->isBuzzerQuiet();
   ccToggle(row, LV_SYMBOL_AUDIO, "Sound", sound_on, ccSoundCb, tw, th, CAT_SOUND);
 #endif
+  // Do Not Disturb (the scheduled-silence feature) — dynamic bell: a plain bell when DND is off,
+  // a bell-with-a-slash when it's on. All boards; the time window lives in Settings > Sound.
+  {
+    const bool dnd_on = touchPrefsGetDndEnabled();
+    ccToggle(row, dnd_on ? TOUCH_SYM_BELL_SLASH : TOUCH_SYM_BELL, "DND", dnd_on, ccDndCb, tw, th, CAT_SOUND);
+  }
   // (Power is the round icon in the card's top-right corner, not a grid chip.)
 }
 
@@ -35788,11 +36022,9 @@ static void buildGlobalStatusBar() {
   lv_label_set_text(g_statusbar.clock, "--:--");
   lv_obj_set_style_text_color(g_statusbar.clock, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
   lv_obj_set_style_text_font(g_statusbar.clock, &g_font_12, LV_PART_MAIN);
-#if defined(HAS_TDECK_GT911)
-  lv_obj_align(g_statusbar.clock, LV_ALIGN_RIGHT_MID, -SC(142), 0);   // extra slot for the sleep moon (T-Deck)
-#else
-  lv_obj_align(g_statusbar.clock, LV_ALIGN_RIGHT_MID, -SC(126), 0);   // shifted left to free a slot for the SD LED
-#endif
+  // Unified across all boards: extra slot reserved for the DND/sleep moon glyph
+  // (T-Deck's sleep_icon and the all-board dnd_icon below both live at -SC(105)).
+  lv_obj_align(g_statusbar.clock, LV_ALIGN_RIGHT_MID, -SC(160), 0);
 
   // Wi-Fi glyph (right of the Bluetooth glyph, left of the signal bars).
   g_statusbar.conn_icon = lv_label_create(g_statusbar.root);
@@ -35801,29 +36033,42 @@ static void buildGlobalStatusBar() {
   lv_obj_set_style_text_font(g_statusbar.conn_icon, &g_font_12, LV_PART_MAIN);
   lv_obj_align(g_statusbar.conn_icon, LV_ALIGN_RIGHT_MID, -SC(73), 0);
 
-  // Bluetooth glyph (left of the SD LED).
+  // Bluetooth glyph (left of the SD LED). Unified offset across all boards (see clock above).
   g_statusbar.ble_icon = lv_label_create(g_statusbar.root);
   lv_label_set_text(g_statusbar.ble_icon, "");
   lv_obj_set_style_text_color(g_statusbar.ble_icon, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
   lv_obj_set_style_text_font(g_statusbar.ble_icon, &g_font_12, LV_PART_MAIN);
-#if defined(HAS_TDECK_GT911)
-  lv_obj_align(g_statusbar.ble_icon, LV_ALIGN_RIGHT_MID, -SC(127), 0);
+  // Narrow bars (V4 portrait) have no DND slot beside BLE and their clock sits at -126, so BLE
+  // stays at -111 there; wide bars keep -SC(127) (tight to the DND moon at -144).
+  lv_obj_align(g_statusbar.ble_icon, LV_ALIGN_RIGHT_MID, (lv_disp_get_hor_res(nullptr) < 300) ? -111 : -SC(127), 0);
 
+#if defined(HAS_TDECK_GT911)
   // Idle power-save readiness indicator — moon glyph, left of the SD LED. T-Deck only,
   // visible only when the feature is enabled; accent colour = ready, grey = blocked.
   g_statusbar.sleep_icon = lv_label_create(g_statusbar.root);
   lv_label_set_text(g_statusbar.sleep_icon, TOUCH_SYM_MOON);
   lv_obj_set_style_text_color(g_statusbar.sleep_icon, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
   lv_obj_set_style_text_font(g_statusbar.sleep_icon, &g_font_12, LV_PART_MAIN);
-  lv_obj_align(g_statusbar.sleep_icon, LV_ALIGN_RIGHT_MID, -SC(105), 0);
+  lv_obj_align(g_statusbar.sleep_icon, LV_ALIGN_RIGHT_MID, -SC(144), 0);
   lv_obj_add_flag(g_statusbar.sleep_icon, LV_OBJ_FLAG_HIDDEN);     // hidden until feature is on
   lv_obj_add_flag(g_statusbar.sleep_icon, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_set_ext_click_area(g_statusbar.sleep_icon, 8);
   lv_obj_add_event_cb(g_statusbar.sleep_icon, sleepIconTapCb, LV_EVENT_CLICKED, nullptr);
   lv_obj_add_flag(g_statusbar.sleep_icon, NAV_SKIP_FLAG);   // status glyph, not a focus-nav target
-#else
-  lv_obj_align(g_statusbar.ble_icon, LV_ALIGN_RIGHT_MID, -SC(111), 0);
 #endif
+
+  // Do Not Disturb glyph — same moon, same slot as the T-Deck sleep_icon above
+  // (sleep_icon is permanently force-hidden every tick, see updateGlobalStatusBar,
+  // since the idle-sleep indicator moved to tinting the battery glyph amber — so
+  // there's no visual collision there; on every other board this is simply a
+  // fresh, all-board indicator in a previously T-Deck-only slot).
+  g_statusbar.dnd_icon = lv_label_create(g_statusbar.root);
+  lv_label_set_text(g_statusbar.dnd_icon, TOUCH_SYM_MOON);
+  lv_obj_set_style_text_color(g_statusbar.dnd_icon, lv_color_hex(COLOR_ACCENT), LV_PART_MAIN);
+  lv_obj_set_style_text_font(g_statusbar.dnd_icon, &g_font_12, LV_PART_MAIN);
+  lv_obj_align(g_statusbar.dnd_icon, LV_ALIGN_RIGHT_MID, -SC(144), 0);
+  lv_obj_add_flag(g_statusbar.dnd_icon, LV_OBJ_FLAG_HIDDEN);   // shown only while DND is active
+  lv_obj_add_flag(g_statusbar.dnd_icon, NAV_SKIP_FLAG);        // passive status glyph, not a focus-nav target
 
   // microSD read/write activity LED — a small amber dot in the gap just left of
   // the Wi-Fi glyph. Hidden when idle; UITask::loop lights it for ~180 ms after
@@ -36288,6 +36533,47 @@ static void updateGlobalStatusBar() {
   if (g_statusbar.sleep_icon) lv_obj_add_flag(g_statusbar.sleep_icon, LV_OBJ_FLAG_HIDDEN);
 #endif
 
+  // ---- Do Not Disturb icon ---- (shown only while the configured silence
+  // window is active — see dndActive()). On cramped bars (T-Display P4's
+  // round-corner two-row layout, or Heltec V4 rotated to portrait, <300px wide)
+  // there's no room for a dedicated slot, so DND borrows the signal-bars slot
+  // instead while active; signal strength reclaims it the rest of the time.
+  {
+    const bool cramped     = CAP_ROUND_CORNERS || (lv_disp_get_hor_res(nullptr) < 300);
+    const bool active      = dndActive();
+    const bool swap_signal = cramped && active;
+
+    static int s_dnd_state = -1;   // (swap_signal<<1 | active) — only touch flags/realign on change
+    const int  state = (swap_signal ? 2 : 0) | (active ? 1 : 0);
+    if (state != s_dnd_state) {
+      s_dnd_state = state;
+      if (g_statusbar.sig_box) {
+        if (swap_signal) lv_obj_add_flag(g_statusbar.sig_box, LV_OBJ_FLAG_HIDDEN);
+        else              lv_obj_clear_flag(g_statusbar.sig_box, LV_OBJ_FLAG_HIDDEN);
+      }
+      if (g_statusbar.dnd_icon) {
+        if (!swap_signal) {
+          // Dedicated slot — re-assert on entry/return so a CAP_ROTATABLE board
+          // (V4) rotating out of portrait mid-DND self-heals from the borrowed
+          // signal-bars position instead of staying stranded there.
+          const int d = batteryIsCharging(batteryMvSmoothed()) ? 32 : 0;
+#if CAP_LARGE_SCREEN
+          lv_obj_align(g_statusbar.dnd_icon, LV_ALIGN_RIGHT_MID, -SC(144) + SC(d), 0);
+#else
+          lv_obj_align(g_statusbar.dnd_icon, LV_ALIGN_RIGHT_MID, -144 + d, 0);
+#endif
+        }
+        if (active) lv_obj_clear_flag(g_statusbar.dnd_icon, LV_OBJ_FLAG_HIDDEN);
+        else        lv_obj_add_flag(g_statusbar.dnd_icon, LV_OBJ_FLAG_HIDDEN);
+      }
+    }
+    // Track sig_box's live position every tick WHILE swapped (cheap; avoids
+    // staleness if a coincident charging-realign or P4 row-slide moves sig_box
+    // the same tick this block's own edge-trigger doesn't fire).
+    if (swap_signal && g_statusbar.sig_box && g_statusbar.dnd_icon)
+      lv_obj_set_pos(g_statusbar.dnd_icon, lv_obj_get_x(g_statusbar.sig_box), lv_obj_get_y(g_statusbar.sig_box));
+  }
+
   // ---- Mesh signal strength ---- (SNR of the last packet we heard; dims when
   // nothing's been heard for a while. The periodic zero-hop "discover" advert in
   // UITask::loop keeps it fresh by prompting nearby nodes/repeaters.)
@@ -36335,26 +36621,31 @@ static void updateGlobalStatusBar() {
 #elif CAP_LARGE_SCREEN
       // Tanmatsu: the cluster is built with SC() UI-scaling, so this slide MUST scale too — the raw
       // offsets below marched the scaled glyphs (incl. the BLE icon) into each other at Large/Huge the
-      // instant charging toggled. Bases match the SC() builder; the clock is re-placed (SC-scaled) by
-      // the clock-placement block just below, and sleep_icon is T-Deck-only, so both are omitted here.
+      // instant charging toggled. Bases match the SC() builder (now unified with the non-large-screen
+      // branch below); the clock is re-placed (SC-scaled) by the clock-placement block just below, and
+      // sleep_icon is T-Deck-only so it's omitted here — dnd_icon is NOT T-Deck-only, so it IS included.
       const int d = charging ? SC(32) : 0;
       if (g_statusbar.sig_box)      lv_obj_align(g_statusbar.sig_box,      LV_ALIGN_RIGHT_MID, -SC(54)  + d, 0);
       if (g_statusbar.conn_icon)    lv_obj_align(g_statusbar.conn_icon,    LV_ALIGN_RIGHT_MID, -SC(73)  + d, 0);
       if (g_statusbar.sd_icon)      lv_obj_align(g_statusbar.sd_icon,      LV_ALIGN_RIGHT_MID, -SC(91)  + d, 0);
-      if (g_statusbar.ble_icon)     lv_obj_align(g_statusbar.ble_icon,     LV_ALIGN_RIGHT_MID, -SC(111) + d, 0);
+      if (g_statusbar.ble_icon)     lv_obj_align(g_statusbar.ble_icon,     LV_ALIGN_RIGHT_MID, -SC(127) + d, 0);
+      if (g_statusbar.dnd_icon)     lv_obj_align(g_statusbar.dnd_icon,     LV_ALIGN_RIGHT_MID, -SC(144) + d, 0);
       if (g_statusbar.layout_label) lv_obj_align(g_statusbar.layout_label, LV_ALIGN_RIGHT_MID, -SC(182) + d, 0);
 #else
       const int d = charging ? 32 : 0;
       // Base offsets MUST match the builder (which shifted for the SD LED): the
-      // SD dot is at -91, ble -111, clock -126, layout -166. The dot slides with
+      // SD dot is at -91, ble -127, clock -142, layout -166. The dot slides with
       // the cluster too so it stays between Wi-Fi and Bluetooth while charging.
       if (g_statusbar.sig_box)      lv_obj_align(g_statusbar.sig_box,      LV_ALIGN_RIGHT_MID, -54  + d, 0);
       if (g_statusbar.conn_icon)    lv_obj_align(g_statusbar.conn_icon,    LV_ALIGN_RIGHT_MID, -73  + d, 0);
       if (g_statusbar.sd_icon)      lv_obj_align(g_statusbar.sd_icon,      LV_ALIGN_RIGHT_MID, -91  + d, 0);
-      if (g_statusbar.ble_icon)     lv_obj_align(g_statusbar.ble_icon,     LV_ALIGN_RIGHT_MID, -127 + d, 0);
-      if (g_statusbar.clock)        lv_obj_align(g_statusbar.clock,        LV_ALIGN_RIGHT_MID, -142 + d, 0);
+      // Narrow bar (V4 portrait) has no DND slot next to BLE (DND borrows the signal slot),
+      // and its clock sits at -126 — so keep BLE at its pre-DND -111 there; -127 lands on the clock.
+      if (g_statusbar.ble_icon)     lv_obj_align(g_statusbar.ble_icon,     LV_ALIGN_RIGHT_MID, (lv_disp_get_hor_res(nullptr) < 300 ? -111 : -127) + d, 0);
+      if (g_statusbar.clock)        lv_obj_align(g_statusbar.clock,        LV_ALIGN_RIGHT_MID, -160 + d, 0);
       if (g_statusbar.layout_label) lv_obj_align(g_statusbar.layout_label, LV_ALIGN_RIGHT_MID, -182 + d, 0);
-      if (g_statusbar.sleep_icon)   lv_obj_align(g_statusbar.sleep_icon,   LV_ALIGN_RIGHT_MID, -105 + d, 0);
+      if (g_statusbar.sleep_icon)   lv_obj_align(g_statusbar.sleep_icon,   LV_ALIGN_RIGHT_MID, -144 + d, 0);
+      if (g_statusbar.dnd_icon)     lv_obj_align(g_statusbar.dnd_icon,     LV_ALIGN_RIGHT_MID, -144 + d, 0);
 #endif
     }
     s_last_pct = pct;
@@ -36443,8 +36734,11 @@ static void updateGlobalStatusBar() {
         // every UI scale (identical to the old -142/-110 at 100%, no node-name regression). Narrow
         // bar keeps its raw values (it was tuned for the V4 portrait layout at 100% only).
         const bool narrow_bar = lv_disp_get_hor_res(nullptr) < 300;
+        // Wide bar shifted 18px further left of its old -142/-110 to open a clean
+        // ~16-17px gap for the DND moon icon (now at -SC(144)) on Bluetooth's left
+        // side, instead of the old cramped 15px gap that used to sit here.
         const int clk_x = narrow_bar ? (charging ? -94 : -126)
-                                     : (charging ? -SC(110) : -SC(142));
+                                     : (charging ? -SC(128) : -SC(160));
         lv_obj_align(g_statusbar.clock, LV_ALIGN_RIGHT_MID, clk_x, 0);
       }
       // Park the async-request spinner just LEFT of the clock wherever it lands,
@@ -40965,6 +41259,19 @@ void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* no
                   (int)SD.cardType());
   }
 #endif
+#if defined(TLORA_PAGER)
+  // Under the LauncherHub the pager runs in the LAUNCHER's partition table, which has NO
+  // dedicated "tiles" partition — so the LittleFS mount above fails and the map showed
+  // "Reflash the tiles partition". Fall back to the microSD card like the T-Deck: cache
+  // Wi-Fi tiles to the SD ROOT /tiles/<z>/<x>/<y>.jpg (merges with any offline /maps library).
+  else if (SD.cardType() != CARD_NONE || fmSdTryMount()) {
+    s_sd_mounted     = true;
+    s_tile_fs        = &SD;
+    s_tile_root[0]   = '\0';
+    s_tiles_fs_ready = true;
+    WIRE_DBG("[TILE] pager: no tiles partition -> caching Wi-Fi tiles on SD /tiles");
+  }
+#endif
 #if defined(HAS_TANMATSU)
   // Tanmatsu has no dedicated "tiles" partition. PREFER the microSD card for the tile cache: the
   // internal FFat 'locfd' partition has a broken FAT metadata layer on this P4 — f_getfree reports
@@ -42214,7 +42521,23 @@ void UITask::setDeviceTimeFromSystemClock() {
 #endif
 }
 
-#if defined(HAS_TDECK_GT911) || defined(HELTEC_LORA_V4_TFT)
+#if defined(HELTEC_LORA_V4_R8)
+// ---- V4-R8 panel sleep (anti burn-in) --------------------------------------
+// The R8 (which defines HELTEC_LORA_V4_TFT too) drives its ST7789 with LovyanGFX
+// on the shared FSPI/SPI2 bus, NOT the Adafruit driver on HSPI. So it must NOT use
+// the HSPI s_cmd_spi shim below: that shim's SPIClass(HSPI)->begin(16,-1,15,-1)
+// re-routes GPIO16/15 (the FSPI SCLK/MOSI LovyanGFX owns) to HSPI, stealing the
+// display bus. After a sleep/wake the panel keeps its last frame (GRAM retained)
+// but LGFX can no longer drive it and the locked flush hangs the loop — the
+// tester's "wake shows the last screen, frozen, needs reset". Route SLPIN/SLPOUT
+// through LGFX's own SPI2 bus instead (display is the LGFXDisplay instance).
+static void touchPanelSleep(bool slp) {
+  static bool s_asleep = false;
+  if (slp == s_asleep) return;
+  s_asleep = slp;
+  display.panelSleep(slp);
+}
+#elif defined(HAS_TDECK_GT911) || defined(HELTEC_LORA_V4_TFT)
 // ---- ST7789 panel sleep (anti burn-in) -------------------------------------
 // Backlight-off alone is NOT screen-off: the ST7789 keeps refreshing the same
 // static image behind the dark backlight, continuously biasing the liquid
@@ -42545,7 +42868,7 @@ void UITask::newMsgImpl(uint8_t path_len, const char* from_name, const char* tex
     const bool is_mention = channel && text && textMentionsMe(text);
     const bool is_dm = (g_last_event == UIEventType::contactMessage);   // private/direct message
     const uint8_t cmute = channel ? touchPrefsGetChannelMute(thread) : 0;
-    if (!isBuzzerQuiet()) {   // master Sound switch: off = silent, overrules everything
+    if (!isBuzzerQuiet() && !dndActive()) {   // master Sound switch / Do Not Disturb: either silences everything
       if (is_mention && touchPrefsGetSoundMentions() && !(cmute & TOUCH_CHMUTE_MEN)) uiPlaySlot(TOUCH_SND_MEN);
       else if (is_dm) { if (touchPrefsGetSoundDirect()) uiPlaySlot(TOUCH_SND_DM); }
       else if (touchPrefsGetSoundMessages() && !(cmute & TOUCH_CHMUTE_MSG))          uiPlaySlot(TOUCH_SND_MSG);

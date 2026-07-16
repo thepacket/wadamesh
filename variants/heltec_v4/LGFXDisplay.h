@@ -52,4 +52,11 @@ public:
 
   // ---- Hardware panel rotation ----
   void setDisplayRotation(uint8_t r);
+
+  // ---- Anti-burn-in panel sleep (SLPIN/SLPOUT) ----
+  // Sends the ST7789 sleep commands over LovyanGFX's OWN SPI2 bus. The shared
+  // touchPanelSleep() path in UITask must call this on the R8 instead of its
+  // HSPI s_cmd_spi shim — that shim re-routes GPIO16/15 to HSPI and steals the
+  // FSPI display pins from LGFX, wedging the bus on wake (frozen last frame).
+  void panelSleep(bool sleep);
 };

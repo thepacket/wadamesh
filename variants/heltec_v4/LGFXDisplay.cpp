@@ -29,7 +29,15 @@ LGFXDisplay::LGFXDisplay(RefCountedDigitalPin* peripher_power)
     cfg.dma_channel = SPI_DMA_CH_AUTO;
     cfg.pin_sclk    = PIN_TFT_SCL;   // 16
     cfg.pin_mosi    = PIN_TFT_SDA;   // 15
-    cfg.pin_miso    = -1;            // panel is write-only; MISO=45 belongs to SD
+    // MISO=45 MUST be routed here even though the ST7789 panel is write-only: the
+    // shared micro-SD (CS=3) READS its data back over this same pin. LovyanGFX owns
+    // SPI2 (it runs first in setup — the display renders fine), so if LGFX leaves
+    // MISO unrouted (-1), the later Arduino SPI.begin() can't retrofit it onto the
+    // already-initialised bus and every SD read returns nothing. That is exactly the
+    // tester signature: a known-good FAT32 card "wants formatting" (FAT can't be read)
+    // and f_mkfs hangs (writes go out on MOSI, the read-back verify never lands).
+    // readable=false in the panel config still keeps LGFX from ever reading the panel.
+    cfg.pin_miso    = PIN_TFT_MISO;  // 45 — needed for shared micro-SD reads
     cfg.pin_dc      = PIN_TFT_DC;    // 48
     _bus.config(cfg);
     _panel.setBus(&_bus);
@@ -141,6 +149,15 @@ void LGFXDisplay::writePixelsRGB565(int x, int y, int w, int h, const uint16_t* 
 void LGFXDisplay::setDisplayRotation(uint8_t r) {
   _lcd.setRotation(r & 3);
   setLogicalSize(_lcd.width(), _lcd.height());
+}
+
+// Anti-burn-in panel sleep over LGFX's own SPI2 bus (SLPIN stops the oscillator/
+// booster/LC drive; panel RAM is retained so wake = SLPOUT and the old frame is
+// back with no redraw). Using LGFX's bus — not a second HSPI SPIClass on the same
+// pins — is what keeps the shared FSPI display bus intact across a wake.
+void LGFXDisplay::panelSleep(bool sleep) {
+  if (sleep) _lcd.sleep();    // SLPIN
+  else       _lcd.wakeup();   // SLPOUT
 }
 
 #endif  // HELTEC_LORA_V4_R8
