@@ -21213,7 +21213,7 @@ static void heardRefill() {
     r.snr_q      = a.snr_q;
     r.rssi       = a.rssi;
     r.sig_known  = (a.snr_q != 0 || a.rssi != 0);
-    r.hops       = a.path_len;
+    r.hops       = a.path_len & 63;   // encoded: low 6 bits = hop count, top 2 = hash size-1
     r.hops_known = true;
     // Only to tick the row and open the contact card — the row itself is not sourced
     // from contacts.

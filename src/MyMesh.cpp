@@ -1808,7 +1808,12 @@ void MyMesh::onDiscoveredContact(ContactInfo &contact, bool is_new, uint8_t path
 #endif
 
   // add inbound-path to mem cache
-  if (path && path_len <= sizeof(AdvertPath::path)) {  // check path is valid
+  // path_len is ENCODED, not a byte count: low 6 bits = hop count, top 2 = hash size-1
+  // (see Packet::getPathHashCount/getPathHashSize). Comparing it against sizeof(path)
+  // therefore rejected every advert whose path uses hashes wider than 1 byte — a
+  // 2-hop path with 3-byte hashes encodes as 130, so those nodes silently never
+  // reached this table and vanished from the Heard list. Use the core's own validator.
+  if (path && mesh::Packet::isValidPathLen(path_len)) {
     AdvertPath* p = advert_paths;
     uint32_t oldest = 0xFFFFFFFF;
     for (int i = 0; i < ADVERT_PATH_TABLE_SIZE; i++) {   // check if already in table, otherwise evict oldest
@@ -1829,8 +1834,12 @@ void MyMesh::onDiscoveredContact(ContactInfo &contact, bool is_new, uint8_t path
     strncpy(p->name, contact.name, sizeof(p->name) - 1);
     p->name[sizeof(p->name) - 1] = '\0';
     p->recv_timestamp = getRTCClock()->getCurrentTime();
-    p->path_len = path_len;
-    memcpy(p->path, path, p->path_len);
+    p->path_len = path_len;                          // kept encoded, as Packet defines it
+    // copyPath writes hash_count*hash_size bytes, NOT path_len of them — the old
+    // memcpy(path, path_len) only happened to be right for 1-byte hashes, and would
+    // have overrun this 64-byte buffer for a long 2- or 3-byte-hash path had the
+    // guard above ever let one through.
+    mesh::Packet::copyPath(p->path, path, path_len);
     // Signal for the Heard list. This runs synchronously inside the advert's own
     // parse, so the radio still holds THIS packet's last-RX state.
     p->snr_q   = (int8_t)(_radio->getLastSNR() * 4.0f);
