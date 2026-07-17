@@ -20525,10 +20525,32 @@ static lv_obj_t*  s_pkt_list      = nullptr;
 static lv_timer_t* s_pkt_timer    = nullptr;
 static uint32_t   s_pkt_last_total = 0xFFFFFFFFu;   // != any real total -> first tick builds
 static uint32_t   s_pkt_last_build = 0;
+static uint8_t    s_pkt_view       = 0;   // 0 = per-frame Packets, 1 = grouped Floods
+static lv_obj_t*  s_pkt_view_lbl   = nullptr;
 static const uint32_t PKT_AGE_REFRESH_MS = 5000;
 
 static void closePacketsPage();
+static void packetsBuildList();
+static void packetsSyncChrome();
 static void pktRowClickedCb(lv_event_t* e);   // defined with the detail view, below
+static lv_obj_t* s_pkt_hdr = nullptr;
+
+// Header + chip always describe whatever s_pkt_view currently is. Owned by the build,
+// not by the tap handler: anything else that flips the view (the doc-capture tour) got
+// the rows right and the labels stale.
+static void packetsSyncChrome() {
+  if (s_pkt_view_lbl) lv_label_set_text(s_pkt_view_lbl, s_pkt_view ? TR("Floods") : TR("Packets"));
+  if (s_pkt_hdr) lv_label_set_text(s_pkt_hdr, s_pkt_view ? TR("Grouped by payload \xC2\xB7 copies")
+                                                         : TR("Type \xC2\xB7 route \xC2\xB7 hops \xC2\xB7 size"));
+}
+
+// Packets <-> Floods. Rebuild rather than filter: the two views have different rows.
+static void pktViewCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  lv_indev_t* a = lv_indev_get_act(); if (a) lv_indev_wait_release(a);
+  s_pkt_view ^= 1;
+  packetsBuildList();
+}
 
 // Colour the RF numbers by what they MEAN, so a row is readable at a glance rather
 // than parsed digit by digit. Same green/amber/red grade the Monitor's link margin
@@ -20991,8 +21013,142 @@ static void pktRowClickedCb(lv_event_t* e) {
   pktOpenDetailFor((uint8_t)(uintptr_t)lv_event_get_user_data(e));
 }
 
+// ---- Floods view ------------------------------------------------------------
+// The same ring at a different altitude. Packets is per-FRAME, which is the wrong
+// unit for flood traffic: one message crossing the mesh arrives as several copies at
+// different hop counts, and the list shows them as unrelated rows. Grouping by
+// payhash — which excludes the path, so every rebroadcast of one payload hashes
+// alike — turns those back into a single fact: "heard 3x, 1-2 hops, best -40 dBm".
+// That is the flood-redundancy question a repeater operator actually has.
+// Computed over the existing ring on demand; no extra per-packet storage.
+struct FloodGroup {
+  uint32_t payhash;
+  uint32_t newest_ms;
+  uint8_t  ptype;
+  uint8_t  copies;
+  uint8_t  hop_min, hop_max;
+  uint8_t  len;
+  int8_t   best_rssi, best_snr_q4;
+  uint8_t  best_idx;      // ring index (i-th newest) of the strongest copy
+};
+// Bounded by the ring: worst case every frame is its own payload.
+static FloodGroup* s_floods   = (FloodGroup*)psAlloc(sizeof(FloodGroup) * MyMesh::UI_RXLOG_MAX);
+static int         s_floods_n = 0;
+
+static int floodCmp(const void* a, const void* b) {
+  const FloodGroup* x = (const FloodGroup*)a;
+  const FloodGroup* y = (const FloodGroup*)b;
+  if (x->copies != y->copies) return (int)y->copies - (int)x->copies;   // most-repeated first
+  return (y->newest_ms > x->newest_ms) ? 1 : (y->newest_ms < x->newest_ms ? -1 : 0);
+}
+
+static void floodsRefill() {
+  s_floods_n = 0;
+  if (!s_floods) return;
+  const uint8_t n = the_mesh.uiRxLogCount();
+  for (uint8_t i = 0; i < n; i++) {
+    MyMesh::UiRxRec r;
+    if (!the_mesh.uiRxLogGet(i, r)) break;
+    if (r.payhash == 0) continue;   // no payload to fingerprint — can't group it honestly
+    FloodGroup* g = nullptr;
+    for (int j = 0; j < s_floods_n; j++)
+      if (s_floods[j].payhash == r.payhash) { g = &s_floods[j]; break; }
+    if (!g) {
+      if (s_floods_n >= MyMesh::UI_RXLOG_MAX) continue;
+      g = &s_floods[s_floods_n++];
+      g->payhash   = r.payhash;
+      g->ptype     = r.ptype;
+      g->copies    = 0;
+      g->hop_min   = r.hops;
+      g->hop_max   = r.hops;
+      g->len       = r.len;
+      g->best_rssi = r.rssi;
+      g->best_snr_q4 = r.snr_q4;
+      g->best_idx  = i;
+      g->newest_ms = r.ms;       // ring is newest-first, so the first hit is the newest
+    }
+    g->copies++;
+    if (r.hops < g->hop_min) g->hop_min = r.hops;
+    if (r.hops > g->hop_max) g->hop_max = r.hops;
+    if (r.snr_q4 > g->best_snr_q4) {   // strongest copy represents the group
+      g->best_snr_q4 = r.snr_q4;
+      g->best_rssi   = r.rssi;
+      g->best_idx    = i;
+    }
+  }
+  if (s_floods_n > 1) qsort(s_floods, s_floods_n, sizeof(s_floods[0]), floodCmp);
+}
+
+static void floodsAddRow(lv_obj_t* parent, const FloodGroup& g, uint32_t now, bool narrow) {
+  lv_obj_t* row = lv_obj_create(parent);
+  lv_obj_remove_style_all(row);
+  lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(row, pktRowClickedCb, LV_EVENT_CLICKED, (void*)(uintptr_t)g.best_idx);
+  lv_obj_set_width(row, LV_PCT(100));
+  lv_obj_set_height(row, 38);
+  lv_obj_set_style_bg_color(row, lv_color_hex(COLOR_PANEL), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(row, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_border_color(row, lv_color_hex(0x18191A), LV_PART_MAIN);
+  lv_obj_set_style_border_width(row, 1, LV_PART_MAIN);
+  lv_obj_set_style_radius(row, 6, LV_PART_MAIN);
+  lv_obj_set_style_pad_hor(row, 8, LV_PART_MAIN);
+  lv_obj_set_style_pad_ver(row, 4, LV_PART_MAIN);
+
+  lv_obj_t* ty = lv_label_create(row);
+  lv_label_set_text(ty, monPtypeName(g.ptype));
+  lv_obj_set_style_text_font(ty, &g_font_14, LV_PART_MAIN);
+  lv_obj_set_style_text_color(ty, lv_color_hex(monPtypeColor(g.ptype)), LV_PART_MAIN);
+  lv_obj_align(ty, LV_ALIGN_TOP_LEFT, 0, 0);
+
+  // The copy count IS the headline here — accent it once it means rebroadcasting.
+  char cp[32];
+  if (g.copies > 1)
+    snprintf(cp, sizeof cp, "#%06X %u %s#", (unsigned)COLOR_ACCENT, (unsigned)g.copies, TR("copies"));
+  else
+    snprintf(cp, sizeof cp, "#5A6166 1 %s#", TR("copy"));   // heard once: nothing rebroadcast it
+  lv_obj_t* cl = lv_label_create(row);
+  lv_label_set_recolor(cl, true);
+  lv_label_set_text(cl, cp);
+  lv_obj_set_style_text_font(cl, &g_font_12, LV_PART_MAIN);
+  lv_obj_set_style_text_color(cl, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+  lv_obj_align(cl, LV_ALIGN_TOP_RIGHT, 0, 2);
+
+  // Hop spread: how far apart the copies reached us. A single number when they all
+  // arrived at the same distance.
+  char meta[56];
+  char hops[20];
+  if (g.hop_min == g.hop_max) {
+    if (g.hop_min == 0) snprintf(hops, sizeof hops, "%s", narrow ? "dir" : TR("direct"));
+    else                snprintf(hops, sizeof hops, "%u %s", (unsigned)g.hop_min,
+                                 narrow ? "h" : (g.hop_min == 1 ? TR("hop") : TR("hops")));
+  } else {
+    snprintf(hops, sizeof hops, "%u-%u %s", (unsigned)g.hop_min, (unsigned)g.hop_max,
+             narrow ? "h" : TR("hops"));
+  }
+  snprintf(meta, sizeof meta, "%s \xC2\xB7 %uB", hops, (unsigned)g.len);
+  lv_obj_t* mt = lv_label_create(row);
+  lv_label_set_text(mt, meta);
+  lv_obj_set_style_text_font(mt, &g_font_12, LV_PART_MAIN);
+  lv_obj_set_style_text_color(mt, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+  lv_obj_align(mt, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+
+  char sig[72];
+  snprintf(sig, sizeof sig, narrow ? "#%06X %d#  #%06X %.1f#" : "#%06X %d dBm#  #%06X %.1f dB#",
+           (unsigned)pktRssiColor(g.best_rssi), (int)g.best_rssi,
+           (unsigned)pktSnrColor(g.best_snr_q4), (double)g.best_snr_q4 / 4.0);
+  lv_obj_t* sg = lv_label_create(row);
+  lv_label_set_recolor(sg, true);
+  lv_label_set_text(sg, sig);
+  lv_obj_set_style_text_font(sg, &g_font_12, LV_PART_MAIN);
+  lv_obj_set_style_text_color(sg, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+  lv_obj_align(sg, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+  (void)now;
+}
+
 static void packetsBuildList() {
   if (!s_pkt_list) return;
+  packetsSyncChrome();
   // A rebuild would otherwise throw the view back to the top mid-scroll.
   const lv_coord_t keep_y = lv_obj_get_scroll_y(s_pkt_list);
   lv_obj_clean(s_pkt_list);
@@ -21003,6 +21159,11 @@ static void packetsBuildList() {
     lv_label_set_text(e, TR("Listening \xE2\x80\x94 nothing heard yet"));
     lv_obj_set_style_text_font(e, &g_font_12, LV_PART_MAIN);
     lv_obj_set_style_text_color(e, lv_color_hex(0x5A6166), LV_PART_MAIN);
+  } else if (s_pkt_view == 1) {
+    const bool narrow = lv_disp_get_hor_res(nullptr) < 280;
+    const uint32_t now = millis();
+    floodsRefill();
+    for (int i = 0; i < s_floods_n; i++) floodsAddRow(s_pkt_list, s_floods[i], now, narrow);
   } else {
     const bool narrow = lv_disp_get_hor_res(nullptr) < 280;
     const uint32_t now = millis();
@@ -21038,8 +21199,9 @@ static void closePacketsPage() {
   closePacketDetail();   // the detail floats over this page — never outlive its list
   if (s_pkt_timer)    { lv_timer_del(s_pkt_timer); s_pkt_timer = nullptr; }
   if (s_packets_root) { popupClose(&s_packets_root); }
-  s_pkt_list = nullptr;
+  s_pkt_list = nullptr; s_pkt_view_lbl = nullptr; s_pkt_hdr = nullptr;
   s_pkt_last_total = 0xFFFFFFFFu;
+  // s_pkt_view is deliberately NOT reset — the chosen view survives reopening.
   if (s_apppage_close == closePacketsPage) {   // release the tall title bar back to normal
     s_apppage_title = nullptr; s_apppage_close = nullptr;
     statusBarSetTall(false); updateGlobalStatusBar();
@@ -21068,14 +21230,33 @@ static void openPacketsPage() {
   updateGlobalStatusBar();
   const int top = STATUSBAR_H + 8;
 
-  // Column key, so the two right-hand numbers don't need a legend.
-  lv_obj_t* hdr = lv_label_create(s_packets_root);
-  lv_label_set_text(hdr, TR("Type \xC2\xB7 route \xC2\xB7 hops \xC2\xB7 size"));
-  lv_obj_set_style_text_font(hdr, &g_font_12, LV_PART_MAIN);
-  lv_obj_set_style_text_color(hdr, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
-  lv_obj_set_pos(hdr, 10, top + 2);
+  // Column key, so the right-hand numbers don't need a legend.
+  s_pkt_hdr = lv_label_create(s_packets_root);
+  lv_label_set_text(s_pkt_hdr, s_pkt_view ? TR("Grouped by payload \xC2\xB7 copies")
+                                          : TR("Type \xC2\xB7 route \xC2\xB7 hops \xC2\xB7 size"));
+  lv_obj_set_style_text_font(s_pkt_hdr, &g_font_12, LV_PART_MAIN);
+  lv_obj_set_style_text_color(s_pkt_hdr, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+  lv_obj_set_pos(s_pkt_hdr, 10, top + 2);
 
-  const int list_y = top + 20;
+  // Per-frame vs grouped-by-payload. Same chip idiom as the Heard sort toggle.
+  lv_obj_t* chip = lv_obj_create(s_packets_root);
+  lv_obj_remove_style_all(chip);
+  lv_obj_add_flag(chip, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_set_size(chip, 66, 20);
+  lv_obj_set_pos(chip, sw - 76, top - 2);
+  lv_obj_set_style_bg_color(chip, lv_color_hex(COLOR_PANEL), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(chip, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_radius(chip, 10, LV_PART_MAIN);
+  lv_obj_set_style_border_color(chip, lv_color_hex(0x18191A), LV_PART_MAIN);
+  lv_obj_set_style_border_width(chip, 1, LV_PART_MAIN);
+  lv_obj_add_event_cb(chip, pktViewCb, LV_EVENT_CLICKED, nullptr);
+  s_pkt_view_lbl = lv_label_create(chip);
+  lv_label_set_text(s_pkt_view_lbl, s_pkt_view ? TR("Floods") : TR("Packets"));
+  lv_obj_set_style_text_font(s_pkt_view_lbl, &g_font_12, LV_PART_MAIN);
+  lv_obj_set_style_text_color(s_pkt_view_lbl, lv_color_hex(COLOR_ACCENT), LV_PART_MAIN);
+  lv_obj_center(s_pkt_view_lbl);
+
+  const int list_y = top + 22;
   s_pkt_list = lv_obj_create(s_packets_root);
   lv_obj_remove_style_all(s_pkt_list);
   lv_obj_set_pos(s_pkt_list, 10, list_y);
@@ -36741,6 +36922,11 @@ static void docCaptureTour() {
   // Decode the newest frame, if the radio has heard anything at all yet.
   if (pktOpenDetailFor(0)) {
     docSettle(14); captureScreenToSerial("app_packet_detail"); closePacketDetail(); docSettle(6);
+  }
+  { // ...and the same ring grouped by payload. Restore the view afterwards.
+    const uint8_t keep = s_pkt_view;
+    s_pkt_view = 1; packetsBuildList(); docSettle(14); captureScreenToSerial("app_floods");
+    s_pkt_view = keep; packetsBuildList(); docSettle(4);
   }
   closePacketsPage();  docSettle(6);
   openHeardPage();    docSettle(14); captureScreenToSerial("app_heard");     closeHeardPage();    docSettle(6);
