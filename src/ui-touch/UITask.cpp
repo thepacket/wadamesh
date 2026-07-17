@@ -13610,6 +13610,16 @@ static void closeActionSheet() {
   }
 }
 
+// An app page (Heard, Packets, Monitor, …) is a full-screen lv_layer_top overlay, so
+// a tab switch happens UNDERNEATH it: the tab really does change, the map really does
+// render, and you see none of it because the page is still covering the screen. Any
+// action that leaves for a TAB has to drop the page first. Popups don't need this —
+// they're added to layer_top afterwards and so draw above the page.
+// No-op when the sheet was opened from a tab (Contacts, Map), where nothing is set.
+static void closeAppPageBeforeTabSwitch() {
+  if (s_apppage_close) s_apppage_close();
+}
+
 static void actionSheetSendMsgCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED || !g_lv.task) return;
   uint32_t idx = s_action_sheet_mesh_idx;
@@ -13620,6 +13630,7 @@ static void actionSheetSendMsgCb(lv_event_t* e) {
   lv_indev_t* act = lv_indev_get_act();
   if (act) lv_indev_wait_release(act);
   closeActionSheet();
+  closeAppPageBeforeTabSwitch();   // else the chat opens under an app page (e.g. Heard)
   g_lv.task->openMeshContactDm(idx);
 }
 
@@ -19700,6 +19711,9 @@ static void openSignalInfoPopup() {
 // frequency (startRecv() is protected) and is deferred to a core change.
 static const int MON_RSSI_MIN = -130;   // chart Y floor (dBm)
 static const int MON_RSSI_MAX = -20;    // chart Y ceiling (dBm)
+// The strip is a glance, not a log: it stays at the last 16 frames even though the
+// RX ring holds more for the Packets app, which is where the full history lives.
+static const int MON_FEED_ROWS = 16;
 
 static lv_obj_t*          s_monitor_root    = nullptr;
 static lv_obj_t*          s_mon_chart       = nullptr;
@@ -19794,7 +19808,7 @@ static void monitorBuildFeed() {
   }
   const uint32_t now = millis();
   char b[760]; int q = 0;
-  for (uint8_t i = 0; i < n && q < (int)sizeof(b) - 72; i++) {
+  for (uint8_t i = 0; i < n && i < MON_FEED_ROWS && q < (int)sizeof(b) - 72; i++) {
     MyMesh::UiRxRec r;
     if (!the_mesh.uiRxLogGet(i, r)) break;
     const uint32_t age = now - r.ms;
@@ -20476,6 +20490,990 @@ static void openMonitorPage() {
   s_mon_timer = lv_timer_create(monitorTimerCb, 300, nullptr);   // ~3 Hz refresh
   lv_obj_move_foreground(s_monitor_root);
   lv_obj_move_foreground(g_statusbar.root);   // keep the tall title bar above this page
+}
+
+// ============================================================
+// Packets app  (app-drawer tile -> APPACT_PACKETS)
+// ============================================================
+// The Monitor's "Recently heard" strip promoted to a page of its own. Monitor
+// answers "how well am I hearing?" — levels, margin, rate, with the feed as a
+// glance. This answers "what exactly did I just hear?": every frame the radio
+// pulled out of the air, newest first, one card each, with the payload type,
+// how it was routed, how far it travelled and how hard it landed.
+// Same source as that feed — the_mesh's recent-RX ring, filled in logRxRaw — so
+// it needs no extra capture, no core hook, and works on every board. Nothing is
+// decrypted or inspected here: the ring holds only what the frame's header
+// already tells us in clear.
+// The list rebuilds only when uiRxLogTotal() moves (or every AGE_REFRESH_MS, so
+// the ages stay honest), which leaves a quiet mesh at ~0 redraws.
+static lv_obj_t*  s_packets_root  = nullptr;
+static lv_obj_t*  s_pkt_list      = nullptr;
+static lv_timer_t* s_pkt_timer    = nullptr;
+static uint32_t   s_pkt_last_total = 0xFFFFFFFFu;   // != any real total -> first tick builds
+static uint32_t   s_pkt_last_build = 0;
+static const uint32_t PKT_AGE_REFRESH_MS = 5000;
+
+static void closePacketsPage();
+static void pktRowClickedCb(lv_event_t* e);   // defined with the detail view, below
+
+// Colour the RF numbers by what they MEAN, so a row is readable at a glance rather
+// than parsed digit by digit. Same green/amber/red grade the Monitor's link margin
+// uses, and the same thresholds as the Heard dot.
+static uint32_t pktSnrColor(int8_t snr_q4) {
+  const int snr = snr_q4 / 4;
+  if (snr >= 5) return 0x6FCF6F;   // comfortable
+  if (snr >= 0) return 0xC9A227;   // workable
+  return 0xE0533D;                 // below the noise floor — decoded on luck
+}
+static uint32_t pktRssiColor(int8_t rssi) {
+  if (rssi >= -95)  return 0x6FCF6F;
+  if (rssi >= -110) return 0xC9A227;
+  return 0xE0533D;
+}
+// Flood traffic is what floods the mesh — worth telling apart from direct at a glance.
+static uint32_t pktRouteColor(uint8_t rt) {
+  switch (rt & 0x03) {
+    case ROUTE_TYPE_FLOOD:
+    case ROUTE_TYPE_TRANSPORT_FLOOD:  return 0xE072B0;   // flood magenta
+    default:                          return 0x6C7CF0;   // direct indigo
+  }
+}
+
+// Route type (raw[0] & 0x03) as a 3-letter code — same order as the core's
+// ROUTE_TYPE_* in Packet.h. "T" prefixed = carries transport codes.
+static const char* pktRouteName(uint8_t rt) {
+  switch (rt & 0x03) {
+    case 0x00: return "TFL";   // transport flood
+    case 0x01: return "FLD";   // flood
+    case 0x02: return "DIR";   // direct
+    default:   return "TDR";   // transport direct
+  }
+}
+
+// "12s" / "5m" / "2h" — the Monitor feed's age format, kept identical so the two
+// pages read the same.
+static void pktFormatAge(uint32_t age_ms, char* out, size_t sz) {
+  if (age_ms < 60000UL)        snprintf(out, sz, "%lus", (unsigned long)(age_ms / 1000));
+  else if (age_ms < 3600000UL) snprintf(out, sz, "%lum", (unsigned long)(age_ms / 60000));
+  else                         snprintf(out, sz, "%luh", (unsigned long)(age_ms / 3600000UL));
+}
+
+// One card per frame. Fixed height so the rebuild can't reflow the list under a
+// scrolling finger.
+static void pktAddRow(lv_obj_t* parent, const MyMesh::UiRxRec& r, uint32_t now, bool narrow,
+                      uint8_t idx) {
+  lv_obj_t* row = lv_obj_create(parent);
+  lv_obj_remove_style_all(row);
+  lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(row, pktRowClickedCb, LV_EVENT_CLICKED, (void*)(uintptr_t)idx);
+  lv_obj_set_width(row, LV_PCT(100));
+  lv_obj_set_height(row, 38);
+  lv_obj_set_style_bg_color(row, lv_color_hex(COLOR_PANEL), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(row, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_border_color(row, lv_color_hex(0x18191A), LV_PART_MAIN);
+  lv_obj_set_style_border_width(row, 1, LV_PART_MAIN);
+  lv_obj_set_style_radius(row, 6, LV_PART_MAIN);
+  lv_obj_set_style_pad_hor(row, 8, LV_PART_MAIN);
+  lv_obj_set_style_pad_ver(row, 4, LV_PART_MAIN);
+
+  // Payload type — the one thing you scan the list for, so it leads, in the same
+  // colour the Monitor feed gives it.
+  lv_obj_t* ty = lv_label_create(row);
+  lv_label_set_text(ty, monPtypeName(r.ptype));
+  lv_obj_set_style_text_font(ty, &g_font_14, LV_PART_MAIN);
+  lv_obj_set_style_text_color(ty, lv_color_hex(monPtypeColor(r.ptype)), LV_PART_MAIN);
+  lv_obj_align(ty, LV_ALIGN_TOP_LEFT, 0, 0);
+
+  // Route / distance / size. hops == 0 means we heard the originator itself. The route
+  // is tinted (flood vs direct); hop count and size stay muted — they're context, not
+  // the headline.
+  char meta[96];
+  if (r.hops == 0)
+    snprintf(meta, sizeof meta, "#%06X %s#  #%06X \xC2\xB7 %s \xC2\xB7 %uB#",
+             (unsigned)pktRouteColor(r.route), pktRouteName(r.route),
+             (unsigned)COLOR_SUB, narrow ? "dir" : "direct", (unsigned)r.len);
+  else
+    snprintf(meta, sizeof meta, "#%06X %s#  #%06X \xC2\xB7 %u %s \xC2\xB7 %uB#",
+             (unsigned)pktRouteColor(r.route), pktRouteName(r.route),
+             (unsigned)COLOR_SUB, (unsigned)r.hops,
+             narrow ? "h" : (r.hops == 1 ? "hop" : "hops"), (unsigned)r.len);
+  lv_obj_t* mt = lv_label_create(row);
+  lv_label_set_recolor(mt, true);
+  lv_label_set_text(mt, meta);
+  lv_obj_set_style_text_font(mt, &g_font_12, LV_PART_MAIN);
+  lv_obj_set_style_text_color(mt, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+  lv_obj_align(mt, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+
+  // Age top-right, signal bottom-right — the two columns your eye tracks down.
+  char ago[10];
+  pktFormatAge(now - r.ms, ago, sizeof ago);
+  lv_obj_t* ag = lv_label_create(row);
+  lv_label_set_text(ag, ago);
+  lv_obj_set_style_text_font(ag, &g_font_12, LV_PART_MAIN);
+  lv_obj_set_style_text_color(ag, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+  lv_obj_align(ag, LV_ALIGN_TOP_RIGHT, 0, 0);
+
+  char sig[72];
+  snprintf(sig, sizeof sig, narrow ? "#%06X %d#  #%06X %.1f#" : "#%06X %d dBm#  #%06X %.1f dB#",
+           (unsigned)pktRssiColor(r.rssi), (int)r.rssi,
+           (unsigned)pktSnrColor(r.snr_q4), (double)r.snr_q4 / 4.0);
+  lv_obj_t* sg = lv_label_create(row);
+  lv_label_set_recolor(sg, true);
+  lv_label_set_text(sg, sig);
+  lv_obj_set_style_text_font(sg, &g_font_12, LV_PART_MAIN);
+  lv_obj_set_style_text_color(sg, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+  lv_obj_align(sg, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+}
+
+// ---- Packet detail ---------------------------------------------------------
+// Tap a card -> decode that frame as far as it can honestly be decoded. Only the
+// header, path and (for channels we hold the key to) the payload are readable;
+// anything else stays sealed and is labelled as such rather than guessed at.
+// The record + its bytes are SNAPSHOTTED on open: the ring keeps filling behind
+// this popup, and "i-th newest" would otherwise slide under the open view.
+static lv_obj_t*      s_pktdet_root = nullptr;
+static MyMesh::UiRxRec s_pktdet_rec;
+static uint8_t        s_pktdet_raw[MyMesh::UI_RX_RAW];
+static uint8_t        s_pktdet_rawlen = 0;
+
+static void closePacketDetail() {
+  if (s_pktdet_root) { popupClose(&s_pktdet_root); }
+}
+static void pktDetDismissCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  lv_indev_t* a = lv_indev_get_act(); if (a) lv_indev_wait_release(a);
+  closePacketDetail();
+}
+
+// ADV_TYPE_* as a word. Shared by the packet detail's advert decode and the Heard
+// list; matches the wording the Contacts tab's Discovered modal already uses.
+static const char* advTypeName(uint8_t t) {
+  switch (t) {
+    case ADV_TYPE_CHAT:     return "chat";
+    case ADV_TYPE_REPEATER: return "repeater";
+    case ADV_TYPE_ROOM:     return "room";
+    case ADV_TYPE_SENSOR:   return "sensor";
+    case ADV_TYPE_NONE:     return "none";
+    default:                return "node";
+  }
+}
+
+// Node-type accent, matching the Discovered/Contacts colour language. Shared by the
+// advert decode and the Heard rows.
+static uint32_t advTypeColor(uint8_t t) {
+  switch (t) {
+    case ADV_TYPE_REPEATER: return 0xA784E0;   // infrastructure violet
+    case ADV_TYPE_ROOM:     return 0x35C9C9;   // room cyan
+    case ADV_TYPE_SENSOR:   return 0xE8A33D;   // sensor amber
+    case ADV_TYPE_CHAT:     return 0x4F9DF7;   // companion blue
+    default:                return 0x9AA3AD;   // unknown grey
+  }
+}
+
+static const char* pktPtypeFull(uint8_t t) {
+  switch (t) {
+    case 0x00: return "Request";        case 0x01: return "Response";
+    case 0x02: return "Text message";   case 0x03: return "Acknowledgement";
+    case 0x04: return "Advert";         case 0x05: return "Group text";
+    case 0x06: return "Group data";     case 0x07: return "Anonymous request";
+    case 0x08: return "Path";           case 0x09: return "Trace";
+    case 0x0A: return "Multipart";      case 0x0B: return "Control";
+    case 0x0F: return "Raw custom";     default:   return "Unknown";
+  }
+}
+static const char* pktRouteFull(uint8_t rt) {
+  switch (rt & 0x03) {
+    case 0x00: return "Transport flood";
+    case 0x01: return "Flood";
+    case 0x02: return "Direct";
+    default:   return "Transport direct";
+  }
+}
+
+// Offset of the payload within a frame: header [+4 transport codes] path_len_flags
+// path... payload. Returns len when there's no payload to point at.
+static int pktPayloadOff(const uint8_t* b, int len) {
+  if (len < 1) return len;
+  const uint8_t rt = b[0] & 0x03;
+  const bool xp = (rt == ROUTE_TYPE_TRANSPORT_FLOOD || rt == ROUTE_TYPE_TRANSPORT_DIRECT);
+  const int ps = 1 + (xp ? 4 : 0);
+  if (ps >= len) return len;
+  const int hcount = b[ps] & 0x3F;
+  const int hsize  = (b[ps] >> 6) + 1;
+  const int po = ps + 1 + hcount * hsize;
+  return (po <= len) ? po : len;
+}
+
+// One "Label  value" row, wadamesh's settings-row idiom: dim label left, value
+// right, wrapping under itself rather than overrunning the label.
+static void pktKv(lv_obj_t* parent, const char* label, const char* value, uint32_t val_col) {
+  lv_obj_t* row = lv_obj_create(parent);
+  lv_obj_remove_style_all(row);
+  lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_width(row, LV_PCT(100));
+  lv_obj_set_height(row, LV_SIZE_CONTENT);
+
+  lv_obj_t* l = lv_label_create(row);
+  lv_label_set_text(l, TR(label));
+  lv_obj_set_style_text_font(l, &g_font_12, LV_PART_MAIN);
+  lv_obj_set_style_text_color(l, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+  lv_obj_align(l, LV_ALIGN_TOP_LEFT, 0, 0);
+
+  lv_obj_t* v = lv_label_create(row);
+  lv_label_set_text(v, value);
+  lv_label_set_long_mode(v, LV_LABEL_LONG_WRAP);
+  lv_obj_set_width(v, LV_PCT(62));
+  lv_obj_set_style_text_align(v, LV_TEXT_ALIGN_RIGHT, LV_PART_MAIN);
+  lv_obj_set_style_text_font(v, &g_font_12, LV_PART_MAIN);
+  lv_obj_set_style_text_color(v, lv_color_hex(val_col), LV_PART_MAIN);
+  lv_obj_align(v, LV_ALIGN_TOP_RIGHT, 0, 0);
+}
+
+static void openPacketDetail() {
+  closePacketDetail();
+  const MyMesh::UiRxRec& r = s_pktdet_rec;
+  const uint8_t* b   = s_pktdet_raw;
+  const int      len = s_pktdet_rawlen;
+  const lv_coord_t sw = lv_disp_get_hor_res(nullptr);
+  const lv_coord_t sh = lv_disp_get_ver_res(nullptr);
+
+  s_pktdet_root = lv_obj_create(lv_layer_top());
+  lv_obj_remove_style_all(s_pktdet_root);
+  lv_obj_set_size(s_pktdet_root, sw, sh - STATUSBAR_H);
+  lv_obj_set_pos(s_pktdet_root, 0, STATUSBAR_H);
+  lv_obj_set_style_bg_color(s_pktdet_root, lv_color_hex(0x000000), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(s_pktdet_root, LV_OPA_60, LV_PART_MAIN);
+  lv_obj_clear_flag(s_pktdet_root, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_event_cb(s_pktdet_root, pktDetDismissCb, LV_EVENT_CLICKED, nullptr);
+
+  lv_obj_t* card = lv_obj_create(s_pktdet_root);
+  lv_obj_remove_style_all(card);
+  lv_obj_set_size(card, sw - 16, sh - STATUSBAR_H - 16);
+  lv_obj_align(card, LV_ALIGN_CENTER, 0, 0);
+  lv_obj_set_style_bg_color(card, lv_color_hex(COLOR_PANEL), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(card, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_radius(card, 8, LV_PART_MAIN);
+  lv_obj_set_style_border_color(card, lv_color_hex(0x18191A), LV_PART_MAIN);
+  lv_obj_set_style_border_width(card, 1, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(card, 10, LV_PART_MAIN);
+  lv_obj_set_scroll_dir(card, LV_DIR_VER);
+  lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(card, 5, LV_PART_MAIN);
+  addCloseXBadge(card, pktDetDismissCb);
+
+  lv_obj_t* ttl = lv_label_create(card);
+  lv_label_set_text(ttl, monPtypeName(r.ptype));
+  lv_obj_set_style_text_font(ttl, &g_font_14, LV_PART_MAIN);
+  lv_obj_set_style_text_color(ttl, lv_color_hex(monPtypeColor(r.ptype)), LV_PART_MAIN);
+
+  char v[176];
+  // Values are tinted by meaning, matching the list's colour language: the type in its
+  // own colour, the route by flood-vs-direct, signal by grade. Structural fields
+  // (length, header, raw) stay muted — colouring everything would mean nothing.
+  pktKv(card, "Type", TR(pktPtypeFull(r.ptype)), monPtypeColor(r.ptype));
+  snprintf(v, sizeof v, "%s (v%u)", TR(pktRouteFull(r.route)), (unsigned)((b[0] >> 6) & 0x03));
+  pktKv(card, "Route", v, pktRouteColor(r.route));
+
+  // Transport codes ride between the header and the path on the TRANSPORT_* routes.
+  if ((r.route == ROUTE_TYPE_TRANSPORT_FLOOD || r.route == ROUTE_TYPE_TRANSPORT_DIRECT) && len >= 5) {
+    snprintf(v, sizeof v, "0x%04X, 0x%04X",
+             (unsigned)(b[1] | (b[2] << 8)), (unsigned)(b[3] | (b[4] << 8)));
+    pktKv(card, "Transport", v, COLOR_TEXT);
+  }
+
+  const int po = pktPayloadOff(b, len);
+  const int ps = 1 + ((r.route == ROUTE_TYPE_TRANSPORT_FLOOD ||
+                       r.route == ROUTE_TYPE_TRANSPORT_DIRECT) ? 4 : 0);
+  const int hsize = (ps < len) ? ((b[ps] >> 6) + 1) : 1;
+
+  // The path is the list of repeaters that forwarded this. On a TRACE the same field
+  // instead carries one signed SNR per hop, so it's read differently.
+  if (r.hops > 0 && ps + 1 <= len) {
+    char path[160]; int q = 0;
+    if (r.ptype == 0x09) {
+      for (int j = 0; j < r.hops && q < (int)sizeof(path) - 12; j++) {
+        const int8_t sq = (int8_t)b[ps + 1 + j * hsize];
+        q += snprintf(path + q, sizeof(path) - q, "%s%.1f", j ? ", " : "", (double)sq / 4.0);
+      }
+      pktKv(card, "Hop SNRs", path, COLOR_TEXT);
+    } else {
+      for (int j = 0; j < r.hops && q < (int)sizeof(path) - 24; j++) {
+        const uint8_t* h = &b[ps + 1 + j * hsize];
+        char nm[32];
+        if (the_mesh.uiHopName(h, hsize, nm, sizeof nm))
+          q += snprintf(path + q, sizeof(path) - q, "%s%s", j ? " > " : "", nm);
+        else
+          q += snprintf(path + q, sizeof(path) - q, "%s%02X", j ? " > " : "", h[0]);
+      }
+      pktKv(card, "Path", path, COLOR_TEXT);
+    }
+  }
+
+  // ---- payload, per type ----
+  const uint8_t* pl = &b[po];
+  const int plav = len - po;          // payload bytes actually present
+  char nm[32];
+  switch (r.ptype) {
+    case 0x00: case 0x01: case 0x02: case 0x08:
+      // These lead with a destination + source hash byte.
+      if (plav >= 1) {
+        if (the_mesh.uiHopName(&pl[0], 1, nm, sizeof nm)) snprintf(v, sizeof v, "%s", nm);
+        else                                              snprintf(v, sizeof v, "%02X", pl[0]);
+        pktKv(card, "Dest", v, COLOR_TEXT);
+      }
+      if (plav >= 2) {
+        if (the_mesh.uiHopName(&pl[1], 1, nm, sizeof nm)) snprintf(v, sizeof v, "%s", nm);
+        else                                              snprintf(v, sizeof v, "%02X", pl[1]);
+        pktKv(card, "Source", v, COLOR_TEXT);
+      }
+      break;
+    case 0x03:
+      if (plav >= 4) {
+        snprintf(v, sizeof v, "0x%02X%02X%02X%02X", pl[3], pl[2], pl[1], pl[0]);
+        pktKv(card, "ACK code", v, COLOR_TEXT);
+      }
+      break;
+    case 0x05: case 0x06: {
+      // Channel traffic: the first payload byte is the channel hash. If that matches a
+      // channel we hold the key for, the rest decrypts; otherwise it stays sealed.
+      bool done = false;
+    #ifdef MAX_GROUP_CHANNELS
+      if (plav >= 2) {
+        for (int i = 0; i < MAX_GROUP_CHANNELS && !done; i++) {
+          ChannelDetails cd{};
+          if (!the_mesh.getChannel(i, cd) || cd.name[0] == '\0') continue;
+          if (cd.channel.hash[0] != pl[0]) continue;
+          pktKv(card, "Channel", cd.name, COLOR_TEXT);
+          uint8_t dec[MAX_TRANS_UNIT];
+          const int n = mesh::Utils::MACThenDecrypt(cd.channel.secret, dec, pl + 1, plav - 1);
+          if (n > 5 && r.ptype == 0x05) {
+            // ts(4) type(1) then the text itself. The plaintext is the payoff of the
+            // whole screen — give it the accent rather than burying it in body grey.
+            const int tn = (n - 5 < (int)sizeof(v) - 1) ? n - 5 : (int)sizeof(v) - 1;
+            memcpy(v, &dec[5], tn); v[tn] = '\0';
+            pktKv(card, "Message", v, COLOR_ACCENT);
+          } else if (n > 0) {
+            snprintf(v, sizeof v, "%d B", n);
+            pktKv(card, "Data", v, COLOR_TEXT);
+          } else {
+            pktKv(card, "Message", TR("(decrypt failed)"), 0xE0533D);   // we hold the key and it still failed — that's wrong
+          }
+          done = true;
+        }
+      }
+    #endif
+      if (!done) {
+        if (plav >= 1) { snprintf(v, sizeof v, "%02X", pl[0]); pktKv(card, "Channel", v, COLOR_SUB); }
+        pktKv(card, "Message", TR("(encrypted \xE2\x80\x94 no key)"), 0x9AA0A6);
+      }
+      break;
+    }
+    case 0x04: {
+      // Advert: pubkey(32) ts(4) sig(64) appdata(...). Everything here is public by
+      // design — it's how nodes announce themselves.
+      if (plav >= 36) {
+        if (the_mesh.uiHopName(&pl[0], 6, nm, sizeof nm)) pktKv(card, "Advertiser", nm, COLOR_TEXT);
+        uint32_t ts; memcpy(&ts, &pl[32], 4);
+        if (r.epoch > 1000000UL) {
+          // How far the sender's clock sits from ours — a big skew breaks message
+          // ordering and ACK matching, so it's worth surfacing.
+          snprintf(v, sizeof v, "%+d s %s", (int)((int32_t)(ts - r.epoch)), TR("vs our clock"));
+          pktKv(card, "Sender clock", v, COLOR_TEXT);
+        }
+      }
+      if (plav > 100) {
+        AdvertDataParser ap(&pl[100], (uint8_t)(plav - 100));
+        if (ap.isValid()) {
+          if (ap.hasName()) pktKv(card, "Node name", ap.getName(), COLOR_TEXT);
+          pktKv(card, "Node type", TR(advTypeName(ap.getType())), advTypeColor(ap.getType()));
+          if (ap.hasLatLon()) {
+            snprintf(v, sizeof v, "%.5f, %.5f", ap.getLat(), ap.getLon());
+            pktKv(card, "Position", v, 0x53C06B);   // location green, as on the Map tile
+          }
+        }
+      }
+      break;
+    }
+    case 0x09:
+      if (plav >= 4) {
+        uint32_t tag; memcpy(&tag, &pl[0], 4);
+        snprintf(v, sizeof v, "0x%08lX", (unsigned long)tag);
+        pktKv(card, "Trace tag", v, COLOR_TEXT);
+      }
+      break;
+    default: break;
+  }
+
+  // ---- signal / physical ----
+  snprintf(v, sizeof v, "%.1f dB / %d dBm", (double)r.snr_q4 / 4.0, (int)r.rssi);
+  pktKv(card, "SNR / RSSI", v, pktSnrColor(r.snr_q4));
+
+  // Link margin: how far this packet's SNR sat above the demodulator floor for the
+  // spreading factor in use. Below ~0 it was luck; that's the actionable number.
+  NodePrefs* pr = the_mesh.getNodePrefs();
+  if (pr && pr->sf >= 7 && pr->sf <= 12) {
+    static const int LIMIT_X10[6] = { -75, -100, -125, -150, -175, -200 };   // SF7..SF12
+    const int m10 = (r.snr_q4 * 10 / 4) - LIMIT_X10[pr->sf - 7];
+    snprintf(v, sizeof v, "%+.1f dB", (double)m10 / 10.0);
+    pktKv(card, "Link margin", v, m10 >= 100 ? 0x6FCF6F : (m10 >= 30 ? 0xC9A227 : 0xE0533D));
+  }
+  snprintf(v, sizeof v, "%d B (%s %d B)", (int)r.len, TR("payload"), plav > 0 ? plav : 0);
+  pktKv(card, "Length", v, COLOR_TEXT);
+  snprintf(v, sizeof v, "%lu ms", (unsigned long)radio_driver.getEstAirtimeFor(r.len));
+  pktKv(card, "Airtime", v, COLOR_TEXT);
+  snprintf(v, sizeof v, "0x%02X", (unsigned)b[0]);
+  pktKv(card, "Header", v, COLOR_TEXT);
+
+  char ago[10]; pktFormatAge(millis() - r.ms, ago, sizeof ago);
+  // localtime_r, not gmtime_r: the rest of the UI (status-bar clock included) shows
+  // local time via the timezone pref, and a UTC stamp here read as an hours-off bug.
+  time_t tt = (time_t)r.epoch; struct tm tmv;
+  if (r.epoch > 1000000UL && localtime_r(&tt, &tmv))
+    snprintf(v, sizeof v, "%02d:%02d:%02d  (%s)", tmv.tm_hour, tmv.tm_min, tmv.tm_sec, ago);
+  else
+    snprintf(v, sizeof v, "%s %s", ago, TR("ago"));
+  pktKv(card, "Received", v, COLOR_TEXT);
+
+  // Copies of one payload = repeaters that rebroadcast it. 1 means we heard it once.
+  const uint8_t copies = the_mesh.uiRxLogCopies(r.payhash);
+  if (r.payhash != 0 && copies > 1) {
+    snprintf(v, sizeof v, "%u %s", (unsigned)copies, TR("copies in log (rebroadcasts)"));
+    pktKv(card, "Seen", v, COLOR_TEXT);
+  }
+
+  // ---- raw hex ----
+  lv_obj_t* rh = lv_label_create(card);
+  lv_label_set_text(rh, TR("Raw"));
+  lv_obj_set_style_text_font(rh, &g_font_12, LV_PART_MAIN);
+  lv_obj_set_style_text_color(rh, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+
+  char hex[3 * 96 + 8]; int q = 0;
+  for (int i = 0; i < len && q < (int)sizeof(hex) - 4; i++)
+    q += snprintf(hex + q, sizeof(hex) - q, "%02X ", b[i]);
+  lv_obj_t* hx = lv_label_create(card);
+  lv_label_set_text(hx, hex);
+  lv_label_set_long_mode(hx, LV_LABEL_LONG_WRAP);
+  lv_obj_set_width(hx, LV_PCT(100));
+  lv_obj_set_style_text_font(hx, &g_font_12, LV_PART_MAIN);
+  lv_obj_set_style_text_color(hx, lv_color_hex(0x8A9196), LV_PART_MAIN);
+
+  lv_obj_move_foreground(s_pktdet_root);
+}
+
+// Snapshot the i-th newest frame + its bytes, then decode. The index is "i-th
+// newest", so it MUST be resolved to a copy now, before the ring moves on.
+static bool pktOpenDetailFor(uint8_t i) {
+  if (!the_mesh.uiRxLogGet(i, s_pktdet_rec)) return false;
+  s_pktdet_rawlen = the_mesh.uiRxLogRaw(i, s_pktdet_raw, sizeof s_pktdet_raw);
+  if (s_pktdet_rawlen == 0) return false;
+  openPacketDetail();
+  return true;
+}
+
+static void pktRowClickedCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  lv_indev_t* a = lv_indev_get_act(); if (a) lv_indev_wait_release(a);
+  pktOpenDetailFor((uint8_t)(uintptr_t)lv_event_get_user_data(e));
+}
+
+static void packetsBuildList() {
+  if (!s_pkt_list) return;
+  // A rebuild would otherwise throw the view back to the top mid-scroll.
+  const lv_coord_t keep_y = lv_obj_get_scroll_y(s_pkt_list);
+  lv_obj_clean(s_pkt_list);
+
+  const uint8_t n = the_mesh.uiRxLogCount();
+  if (n == 0) {
+    lv_obj_t* e = lv_label_create(s_pkt_list);
+    lv_label_set_text(e, TR("Listening \xE2\x80\x94 nothing heard yet"));
+    lv_obj_set_style_text_font(e, &g_font_12, LV_PART_MAIN);
+    lv_obj_set_style_text_color(e, lv_color_hex(0x5A6166), LV_PART_MAIN);
+  } else {
+    const bool narrow = lv_disp_get_hor_res(nullptr) < 280;
+    const uint32_t now = millis();
+    for (uint8_t i = 0; i < n; i++) {
+      MyMesh::UiRxRec r;
+      if (!the_mesh.uiRxLogGet(i, r)) break;
+      pktAddRow(s_pkt_list, r, now, narrow, i);
+    }
+  }
+  lv_obj_scroll_to_y(s_pkt_list, keep_y, LV_ANIM_OFF);
+  s_pkt_last_total = the_mesh.uiRxLogTotal();
+  s_pkt_last_build = millis();
+}
+
+static void packetsTimerCb(lv_timer_t* t) {
+  (void)t;
+  if (!s_pkt_list) return;
+  if (s_pktdet_root) return;   // a detail is open over the list — don't churn underneath it
+  const bool new_traffic = (the_mesh.uiRxLogTotal() != s_pkt_last_total);
+  const bool ages_stale  = (millis() - s_pkt_last_build) >= PKT_AGE_REFRESH_MS;
+  if (new_traffic || ages_stale) packetsBuildList();
+}
+
+static void packetsDismissCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  // Backdrop only — taps bubbling up from a row leave the page open.
+  if (lv_event_get_target(e) != lv_event_get_current_target(e)) return;
+  lv_indev_t* a = lv_indev_get_act(); if (a) lv_indev_wait_release(a);
+  closePacketsPage();
+}
+
+static void closePacketsPage() {
+  closePacketDetail();   // the detail floats over this page — never outlive its list
+  if (s_pkt_timer)    { lv_timer_del(s_pkt_timer); s_pkt_timer = nullptr; }
+  if (s_packets_root) { popupClose(&s_packets_root); }
+  s_pkt_list = nullptr;
+  s_pkt_last_total = 0xFFFFFFFFu;
+  if (s_apppage_close == closePacketsPage) {   // release the tall title bar back to normal
+    s_apppage_title = nullptr; s_apppage_close = nullptr;
+    statusBarSetTall(false); updateGlobalStatusBar();
+  }
+}
+
+static void openPacketsPage() {
+  closePacketsPage();
+  const lv_coord_t sw = lv_disp_get_hor_res(nullptr);
+  const lv_coord_t sh = lv_disp_get_ver_res(nullptr);
+  const int H = sh - STATUSBAR_H;
+  s_packets_root = lv_obj_create(lv_layer_top());
+  lv_obj_remove_style_all(s_packets_root);
+  lv_obj_set_size(s_packets_root, sw, H);
+  lv_obj_set_pos(s_packets_root, 0, STATUSBAR_H);
+  lv_obj_set_style_bg_color(s_packets_root, lv_color_hex(COLOR_BG), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(s_packets_root, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_clear_flag(s_packets_root, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_event_cb(s_packets_root, packetsDismissCb, LV_EVENT_CLICKED, nullptr);
+
+  // Settings-subpage chrome, same as the Monitor: the GLOBAL status bar goes tall
+  // and shows "‹ Packets" (tap the bar = Back). No second header.
+  s_apppage_title = "Packets";
+  s_apppage_close = closePacketsPage;
+  statusBarSetTall(true);
+  updateGlobalStatusBar();
+  const int top = STATUSBAR_H + 8;
+
+  // Column key, so the two right-hand numbers don't need a legend.
+  lv_obj_t* hdr = lv_label_create(s_packets_root);
+  lv_label_set_text(hdr, TR("Type \xC2\xB7 route \xC2\xB7 hops \xC2\xB7 size"));
+  lv_obj_set_style_text_font(hdr, &g_font_12, LV_PART_MAIN);
+  lv_obj_set_style_text_color(hdr, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+  lv_obj_set_pos(hdr, 10, top + 2);
+
+  const int list_y = top + 20;
+  s_pkt_list = lv_obj_create(s_packets_root);
+  lv_obj_remove_style_all(s_pkt_list);
+  lv_obj_set_pos(s_pkt_list, 10, list_y);
+  lv_obj_set_size(s_pkt_list, sw - 20, H - list_y - 6);
+  lv_obj_set_style_bg_opa(s_pkt_list, LV_OPA_TRANSP, LV_PART_MAIN);
+  lv_obj_set_scroll_dir(s_pkt_list, LV_DIR_VER);
+  lv_obj_set_scrollbar_mode(s_pkt_list, LV_SCROLLBAR_MODE_AUTO);
+  lv_obj_set_flex_flow(s_pkt_list, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(s_pkt_list, 4, LV_PART_MAIN);
+
+  packetsBuildList();
+  s_pkt_timer = lv_timer_create(packetsTimerCb, 1000, nullptr);   // 1 Hz; the build is change-gated
+  lv_obj_move_foreground(s_packets_root);
+  lv_obj_move_foreground(g_statusbar.root);   // keep the tall title bar above this page
+}
+
+// ============================================================
+// Heard app  (app-drawer tile -> APPACT_HEARD)
+// ============================================================
+// Who is out there, and how well can I hear them. Packets is per-FRAME; this is
+// per-NODE: one row per station whose advert we've received, strongest-or-newest
+// first, showing how hard it landed, what it claims to be, and how far off it is.
+// Source is the mesh's own advert_paths table (filled in onDiscoveredContact),
+// which sees EVERY advert — including nodes already in Contacts. That's the whole
+// point of it next to the Contacts tab's "Discovered" modal, which deliberately
+// lists only what you HAVEN'T saved and exists to drive the add-to-contacts flow.
+// Heard answers "how is my mesh reaching me", Discovered answers "what's new".
+// Everything here is as-advertised: a node states its own name, type and position.
+// The advert's signature is verified by the core, but its CONTENTS are self-reported.
+static lv_obj_t*   s_heard_root  = nullptr;
+static lv_obj_t*   s_heard_list  = nullptr;
+static lv_timer_t* s_heard_timer = nullptr;
+static lv_obj_t*   s_heard_sort_lbl = nullptr;
+static uint8_t     s_heard_sort  = 0;      // 0 = recent, 1 = strongest signal
+static int         s_heard_last_n = -1;
+static uint32_t    s_heard_last_build = 0;
+
+static void closeHeardPage();
+static void heardBuildList();
+
+// Tap a row -> that node's contact card, the same sheet the Contacts tab opens, so
+// favourite / reset-path / remove all work from here. A node we haven't saved has no
+// card to open; rather than silently doing nothing, point at the flow that adds it.
+static void heardRowClickedCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  lv_indev_t* a = lv_indev_get_act(); if (a) lv_indev_wait_release(a);
+  const int cidx = (int)(intptr_t)lv_event_get_user_data(e);
+  if (cidx < 0) {
+    if (g_lv.task) g_lv.task->showAlert(TR("Not in contacts \xE2\x80\x94 add from Contacts"), 1600);
+    return;
+  }
+  ContactInfo c;
+  if (!the_mesh.getContactByIdx((uint32_t)cidx, c)) return;   // removed under us
+  openContactActionSheet((uint32_t)cidx, c.type == ADV_TYPE_REPEATER, c.name);
+}
+
+// One row, merged from the two sources below.
+struct HeardRow {
+  char     name[32];
+  uint8_t  key[6];
+  uint8_t  type;
+  int32_t  gps_lat, gps_lon;
+  uint32_t last_ts;        // RTC secs of its last advert (0 = unknown)
+  int8_t   snr_q, rssi;    // only meaningful when sig_known
+  uint8_t  hops;
+  bool     sig_known;      // heard THIS boot, so we have real signal for it
+  bool     hops_known;
+  int      cidx;           // saved-contact index, or -1 if we've never kept it
+};
+// The list can't outgrow its only source.
+static const int HEARD_MAX = ADVERT_PATH_TABLE_SIZE;
+
+// PSRAM-first like the other big UI caches — internal DRAM is the scarce one here.
+static HeardRow*   s_heard    = (HeardRow*)psAlloc(sizeof(HeardRow) * HEARD_MAX);
+static int         s_heard_n  = 0;
+// getRecentlyHeard() needs somewhere to write; an AdvertPath[16] is ~1.9 KB, far too
+// much to put on an LVGL timer callback's stack.
+static AdvertPath* s_heard_ap = (AdvertPath*)psAlloc(sizeof(AdvertPath) * ADVERT_PATH_TABLE_SIZE);
+
+// Signal dot: green / amber / red on SNR. 0 means the entry predates the signal
+// capture (or came in with none), so it reads as unknown rather than as terrible.
+static uint32_t heardSnrColor(int8_t snr_q, bool known) {
+  if (!known) return 0x5A6166;
+  const int snr = snr_q / 4;
+  if (snr >= 5) return 0x6FCF6F;
+  if (snr >= 0) return 0xC9A227;
+  return 0xE0533D;
+}
+
+// Strongest first; nodes with no signal this boot sink to the bottom rather than
+// pretending to be 0 dB.
+static int heardCmpSignal(const void* a, const void* b) {
+  const HeardRow* x = (const HeardRow*)a;
+  const HeardRow* y = (const HeardRow*)b;
+  if (x->sig_known != y->sig_known) return x->sig_known ? -1 : 1;
+  if (!x->sig_known) return 0;
+  return y->snr_q - x->snr_q;
+}
+// Most recently heard first; unknown timestamps sink.
+static int heardCmpRecent(const void* a, const void* b) {
+  const uint32_t x = ((const HeardRow*)a)->last_ts;
+  const uint32_t y = ((const HeardRow*)b)->last_ts;
+  if (x == y) return 0;
+  if (x == 0) return 1;
+  if (y == 0) return -1;
+  return (y > x) ? 1 : -1;   // subtracting uint32 epochs would overflow an int
+}
+
+// Initial great-circle heading, snapped to 8 points. The file's other two bearing
+// helpers (bearingCardinal, losCompass) each sit behind a board-specific #if
+// (HAS_EXPANSION_KIT / MULTI_TRANSPORT_COMPANION), so Heard carries its own rather
+// than only building on the boards those happen to be enabled for.
+static const char* heardBearingPoint(double lat1, double lon1, double lat2, double lon2) {
+  static const char* k_pts[8] = { "N", "NE", "E", "SE", "S", "SW", "W", "NW" };
+  const double p1 = lat1 * M_PI / 180.0, p2 = lat2 * M_PI / 180.0;
+  const double dl = (lon2 - lon1) * M_PI / 180.0;
+  const double y = sin(dl) * cos(p2);
+  const double x = cos(p1) * sin(p2) - sin(p1) * cos(p2) * cos(dl);
+  double b = atan2(y, x) * 180.0 / M_PI;
+  if (b < 0) b += 360.0;
+  return k_pts[(int)((b + 22.5) / 45.0) & 7];
+}
+
+// Refill s_heard from the mesh. getRecentlyHeard() hands back the table already
+// sorted by recency (and including empty slots), so filtering is our job.
+// Source is advert_paths ONLY: adverts this radio actually received, this boot.
+// Deliberately NOT persisted and deliberately not merged with saved contacts. Heard
+// is a measurement, not an address book — a row means "I heard this node, here is how
+// it landed". Folding in contacts made the page list nodes that were never heard,
+// which is why it could show a screenful while Packets honestly showed one frame.
+// The list is therefore empty after a reboot and fills as nodes advertise. That is
+// correct: nothing has been heard yet. Contacts already answers "who do I know".
+static void heardRefill() {
+  s_heard_n = 0;
+  if (!s_heard || !s_heard_ap) return;
+
+  const int na = the_mesh.getRecentlyHeard(s_heard_ap, ADVERT_PATH_TABLE_SIZE);
+  for (int i = 0; i < na && s_heard_n < HEARD_MAX; i++) {
+    const AdvertPath& a = s_heard_ap[i];
+    if (a.name[0] == '\0' && a.recv_timestamp == 0) continue;      // empty slot
+    HeardRow& r = s_heard[s_heard_n++];
+    memset(&r, 0, sizeof r);
+    strncpy(r.name, a.name, sizeof(r.name) - 1);
+    memcpy(r.key, a.pubkey_prefix, sizeof(r.key));
+    r.type       = a.type;
+    r.gps_lat    = a.gps_lat;
+    r.gps_lon    = a.gps_lon;
+    r.last_ts    = a.recv_timestamp;
+    r.snr_q      = a.snr_q;
+    r.rssi       = a.rssi;
+    r.sig_known  = (a.snr_q != 0 || a.rssi != 0);
+    r.hops       = a.path_len;
+    r.hops_known = true;
+    // Only to tick the row and open the contact card — the row itself is not sourced
+    // from contacts.
+    r.cidx = the_mesh.uiContactIdxByPubKey(a.pubkey_prefix, sizeof(a.pubkey_prefix));
+  }
+
+  if (s_heard_n > 1)
+    qsort(s_heard, s_heard_n, sizeof(s_heard[0]),
+          s_heard_sort == 1 ? heardCmpSignal : heardCmpRecent);
+}
+
+// Row geometry: pad(5) + name(18) + meta(14) + signal(14) + pad(5). The three text
+// baselines are fixed so nothing can collide as strings change width.
+static const int HEARD_ROW_H  = 56;
+static const int HEARD_Y_NAME = 0;
+static const int HEARD_Y_META = 19;
+static const int HEARD_Y_SIG  = 34;
+
+static void heardAddRow(lv_obj_t* parent, const HeardRow& a, uint32_t now_secs,
+                        double self_lat, double self_lon, bool narrow) {
+  lv_obj_t* row = lv_obj_create(parent);
+  lv_obj_remove_style_all(row);
+  lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_width(row, LV_PCT(100));
+  // Three stacked text lines at 14/12/12 px. Every child is positioned from the TOP
+  // with an explicit y: mixing TOP_ and BOTTOM_ anchors in a fixed-height row is what
+  // made the type line and the signal line overlap.
+  lv_obj_set_height(row, HEARD_ROW_H);
+  lv_obj_set_style_bg_color(row, lv_color_hex(COLOR_PANEL), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(row, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_border_color(row, lv_color_hex(0x18191A), LV_PART_MAIN);
+  lv_obj_set_style_border_width(row, 1, LV_PART_MAIN);
+  lv_obj_set_style_radius(row, 6, LV_PART_MAIN);
+  lv_obj_set_style_pad_hor(row, 8, LV_PART_MAIN);
+  lv_obj_set_style_pad_ver(row, 5, LV_PART_MAIN);
+
+  const bool sig_known = a.sig_known;
+
+  // Signal dot, far left — the column you scan down.
+  lv_obj_t* dot = lv_obj_create(row);
+  lv_obj_remove_style_all(dot);
+  lv_obj_clear_flag(dot, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_size(dot, 8, 8);
+  lv_obj_set_style_bg_color(dot, lv_color_hex(heardSnrColor(a.snr_q, sig_known)), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_radius(dot, 4, LV_PART_MAIN);
+  lv_obj_align(dot, LV_ALIGN_TOP_LEFT, 0, 4);
+
+  // Name + a tick when it's already one of ours. The index doubles as the tap
+  // target: the contact card is keyed by it.
+  char nm[44];
+  const int  cidx  = a.cidx;
+  const bool saved = (cidx >= 0);
+  lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+  // Carry the contact index, not a row position: the list re-sorts underneath and a
+  // position would go stale. -1 means unsaved, and the tap says so.
+  lv_obj_add_event_cb(row, heardRowClickedCb, LV_EVENT_CLICKED, (void*)(intptr_t)cidx);
+  // The tick reads as "kept" — green, not the same grey as everything else.
+  snprintf(nm, sizeof nm, "%s%s", a.name[0] ? a.name : TR("(unnamed)"),
+           saved ? "  #6FCF6F " LV_SYMBOL_OK "#" : "");
+  lv_obj_t* nl = lv_label_create(row);
+  lv_label_set_recolor(nl, true);
+  lv_label_set_text(nl, nm);
+  lv_label_set_long_mode(nl, LV_LABEL_LONG_DOT);
+  lv_obj_set_width(nl, LV_PCT(56));
+  lv_obj_set_style_text_font(nl, &g_font_14, LV_PART_MAIN);
+  lv_obj_set_style_text_color(nl, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+  lv_obj_align(nl, LV_ALIGN_TOP_LEFT, 14, HEARD_Y_NAME);
+
+  // type · hops, tinted by type. path_len is the hop count (1-byte hashes).
+  // Hops come from the advert's inbound path, so they're only known for a node heard
+  // this boot; a contact-only row says nothing rather than guessing from its route.
+  char meta[56];
+  const unsigned hops = a.hops;
+  if (!a.hops_known)
+    snprintf(meta, sizeof meta, "%s", TR(advTypeName(a.type)));
+  else if (hops == 0)
+    snprintf(meta, sizeof meta, "%s \xC2\xB7 %s", TR(advTypeName(a.type)), TR("direct"));
+  else
+    snprintf(meta, sizeof meta, "%s \xC2\xB7 %u %s", TR(advTypeName(a.type)), hops,
+             narrow ? "h" : (hops == 1 ? TR("hop") : TR("hops")));
+  lv_obj_t* ml = lv_label_create(row);
+  lv_label_set_text(ml, meta);
+  lv_obj_set_style_text_font(ml, &g_font_12, LV_PART_MAIN);
+  lv_obj_set_style_text_color(ml, lv_color_hex(advTypeColor(a.type)), LV_PART_MAIN);
+  lv_obj_align(ml, LV_ALIGN_TOP_LEFT, 14, HEARD_Y_META);
+
+  // SNR / RSSI as heard.
+  // Recoloured: the numbers carry the same green/amber/red grade as the dot, so the
+  // row reads at a glance instead of having to be parsed.
+  char sig[72];
+  if (sig_known)
+    snprintf(sig, sizeof sig, narrow ? "#%06X %.1f#  #%06X %d#" : "#%06X SNR %.1f dB#   #%06X RSSI %d#",
+             (unsigned)heardSnrColor(a.snr_q, true), (double)a.snr_q / 4.0,
+             (unsigned)COLOR_SUB, (int)a.rssi);
+  else
+    // Every row here WAS heard, so this is the rare case of an advert logged with no
+    // signal reading attached — not the "haven't heard it" case.
+    snprintf(sig, sizeof sig, "#5A6166 %s#", TR("signal unknown"));
+  lv_obj_t* sl = lv_label_create(row);
+  lv_label_set_recolor(sl, true);
+  lv_label_set_text(sl, sig);
+  lv_obj_set_style_text_font(sl, &g_font_12, LV_PART_MAIN);
+  lv_obj_set_style_text_color(sl, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+  lv_obj_align(sl, LV_ALIGN_TOP_LEFT, 14, HEARD_Y_SIG);
+
+  // Age top-right; distance + bearing under it when both ends have a fix.
+  uint32_t age_secs = 0;
+  if (now_secs > a.last_ts && a.last_ts != 0) age_secs = now_secs - a.last_ts;
+  char age[12]; formatAgeBadge(age, sizeof age, age_secs);
+  lv_obj_t* al = lv_label_create(row);
+  lv_label_set_text(al, age);
+  lv_obj_set_style_text_font(al, &g_font_12, LV_PART_MAIN);
+  lv_obj_set_style_text_color(al, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+  lv_obj_align(al, LV_ALIGN_TOP_RIGHT, 0, HEARD_Y_NAME + 2);
+
+  char dist[12];
+  formatDistanceBadge(dist, sizeof dist, self_lat, self_lon, a.gps_lat, a.gps_lon);
+  char loc[24];
+  if (dist[0]) {
+    // Bearing only means something once we know both positions — and
+    // formatDistanceBadge already left `dist` empty unless both fixes exist.
+    const char* pt = heardBearingPoint(self_lat, self_lon,
+                                       (double)a.gps_lat / 1.0e6,
+                                       (double)a.gps_lon / 1.0e6);
+    snprintf(loc, sizeof loc, "%s %s", dist, pt);
+  } else {
+    loc[0] = '\0';
+  }
+  if (loc[0]) {
+    lv_obj_t* dl = lv_label_create(row);
+    lv_label_set_text(dl, loc);
+    lv_obj_set_style_text_font(dl, &g_font_12, LV_PART_MAIN);
+    lv_obj_set_style_text_color(dl, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+    lv_obj_align(dl, LV_ALIGN_TOP_RIGHT, 0, HEARD_Y_META);
+  }
+}
+
+static void heardBuildList() {
+  if (!s_heard_list) return;
+  const lv_coord_t keep_y = lv_obj_get_scroll_y(s_heard_list);
+  lv_obj_clean(s_heard_list);
+  heardRefill();
+
+  if (s_heard_n == 0) {
+    lv_obj_t* e = lv_label_create(s_heard_list);
+    lv_label_set_text(e, TR("No adverts heard yet"));
+    lv_obj_set_style_text_font(e, &g_font_12, LV_PART_MAIN);
+    lv_obj_set_style_text_color(e, lv_color_hex(0x5A6166), LV_PART_MAIN);
+  } else {
+    const bool narrow = lv_disp_get_hor_res(nullptr) < 280;
+    const uint32_t now_secs = the_mesh.getRTCClock()->getCurrentTime();
+    const double self_lat = g_lv.task ? g_lv.task->getNodeLat() : 0.0;
+    const double self_lon = g_lv.task ? g_lv.task->getNodeLon() : 0.0;
+    for (int i = 0; i < s_heard_n; i++)
+      heardAddRow(s_heard_list, s_heard[i], now_secs, self_lat, self_lon, narrow);
+  }
+  lv_obj_scroll_to_y(s_heard_list, keep_y, LV_ANIM_OFF);
+  s_heard_last_n     = s_heard_n;
+  s_heard_last_build = millis();
+}
+
+// Adverts are minutes apart, so this is a slow page: rebuild when the population
+// changes, and otherwise every 10 s to keep the ages honest.
+static void heardTimerCb(lv_timer_t* t) {
+  (void)t;
+  if (!s_heard_list) return;
+  // Count only — getRecentlyHeard() would qsort the mesh's live table on every tick.
+  // The 10 s sweep catches a re-advert that refreshes an existing row's signal/age
+  // without changing the population.
+  const int live = the_mesh.uiHeardCount();
+  if (live != s_heard_last_n || (millis() - s_heard_last_build) >= 10000UL) heardBuildList();
+}
+
+static void heardSortCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  lv_indev_t* a = lv_indev_get_act(); if (a) lv_indev_wait_release(a);
+  s_heard_sort ^= 1;
+  if (s_heard_sort_lbl)
+    lv_label_set_text(s_heard_sort_lbl, s_heard_sort ? TR("Signal") : TR("Recent"));
+  heardBuildList();
+}
+
+static void heardDismissCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  if (lv_event_get_target(e) != lv_event_get_current_target(e)) return;
+  lv_indev_t* a = lv_indev_get_act(); if (a) lv_indev_wait_release(a);
+  closeHeardPage();
+}
+
+static void closeHeardPage() {
+  if (s_heard_timer) { lv_timer_del(s_heard_timer); s_heard_timer = nullptr; }
+  if (s_heard_root)  { popupClose(&s_heard_root); }
+  s_heard_list = nullptr; s_heard_sort_lbl = nullptr;
+  s_heard_last_n = -1;
+  if (s_apppage_close == closeHeardPage) {
+    s_apppage_title = nullptr; s_apppage_close = nullptr;
+    statusBarSetTall(false); updateGlobalStatusBar();
+  }
+}
+
+static void openHeardPage() {
+  closeHeardPage();
+  const lv_coord_t sw = lv_disp_get_hor_res(nullptr);
+  const lv_coord_t sh = lv_disp_get_ver_res(nullptr);
+  const int H = sh - STATUSBAR_H;
+  s_heard_root = lv_obj_create(lv_layer_top());
+  lv_obj_remove_style_all(s_heard_root);
+  lv_obj_set_size(s_heard_root, sw, H);
+  lv_obj_set_pos(s_heard_root, 0, STATUSBAR_H);
+  lv_obj_set_style_bg_color(s_heard_root, lv_color_hex(COLOR_BG), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(s_heard_root, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_clear_flag(s_heard_root, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_event_cb(s_heard_root, heardDismissCb, LV_EVENT_CLICKED, nullptr);
+
+  s_apppage_title = "Heard";
+  s_apppage_close = closeHeardPage;
+  statusBarSetTall(true);
+  updateGlobalStatusBar();
+  const int top = STATUSBAR_H + 8;
+
+  lv_obj_t* hdr = lv_label_create(s_heard_root);
+  lv_label_set_text(hdr, TR("Nodes that advertised"));
+  lv_obj_set_style_text_font(hdr, &g_font_12, LV_PART_MAIN);
+  lv_obj_set_style_text_color(hdr, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+  lv_obj_set_pos(hdr, 10, top + 2);
+
+  // Sort chip, right-aligned on the header line.
+  lv_obj_t* chip = lv_obj_create(s_heard_root);
+  lv_obj_remove_style_all(chip);
+  lv_obj_add_flag(chip, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_set_size(chip, 66, 20);
+  lv_obj_set_pos(chip, sw - 76, top - 2);
+  lv_obj_set_style_bg_color(chip, lv_color_hex(COLOR_PANEL), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(chip, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_radius(chip, 10, LV_PART_MAIN);
+  lv_obj_set_style_border_color(chip, lv_color_hex(0x18191A), LV_PART_MAIN);
+  lv_obj_set_style_border_width(chip, 1, LV_PART_MAIN);
+  lv_obj_add_event_cb(chip, heardSortCb, LV_EVENT_CLICKED, nullptr);
+  s_heard_sort_lbl = lv_label_create(chip);
+  lv_label_set_text(s_heard_sort_lbl, s_heard_sort ? TR("Signal") : TR("Recent"));
+  lv_obj_set_style_text_font(s_heard_sort_lbl, &g_font_12, LV_PART_MAIN);
+  lv_obj_set_style_text_color(s_heard_sort_lbl, lv_color_hex(COLOR_ACCENT), LV_PART_MAIN);
+  lv_obj_center(s_heard_sort_lbl);
+
+  const int list_y = top + 22;
+  s_heard_list = lv_obj_create(s_heard_root);
+  lv_obj_remove_style_all(s_heard_list);
+  lv_obj_set_pos(s_heard_list, 10, list_y);
+  lv_obj_set_size(s_heard_list, sw - 20, H - list_y - 6);
+  lv_obj_set_style_bg_opa(s_heard_list, LV_OPA_TRANSP, LV_PART_MAIN);
+  lv_obj_set_scroll_dir(s_heard_list, LV_DIR_VER);
+  lv_obj_set_scrollbar_mode(s_heard_list, LV_SCROLLBAR_MODE_AUTO);
+  lv_obj_set_flex_flow(s_heard_list, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(s_heard_list, 4, LV_PART_MAIN);
+
+  heardBuildList();
+  s_heard_timer = lv_timer_create(heardTimerCb, 2000, nullptr);
+  lv_obj_move_foreground(s_heard_root);
+  lv_obj_move_foreground(g_statusbar.root);
 }
 
 // ============================================================
@@ -25735,6 +26733,9 @@ static void actionSheetShowOnMapCb(lv_event_t* e) {
   s_map_center_lon = (double)c.gps_lon / 1.0e6;
   s_map_view_inited = true;   // keep this centre — don't recentre on self on open
   if (s_map_zoom < k_map_zoom_max) s_map_zoom = (uint8_t)(s_map_zoom + 1);
+  // Only once we're actually committed to the map — the "no location" path above
+  // leaves the calling page up, since nothing navigated.
+  closeAppPageBeforeTabSwitch();
   goToTab(MAP_TAB_INDEX);      // onMapTabActivated renders tiles + markers + overlay
 }
 
@@ -34849,7 +35850,7 @@ static void openControlCenter() {
 enum AppDrawerAction {
   APPACT_CHATS, APPACT_CONTACTS, APPACT_MAP, APPACT_SETTINGS,
   APPACT_ADVERT, APPACT_POWER, APPACT_MENTIONS, APPACT_CMDCENTER, APPACT_SIGNAL,
-  APPACT_TERMINAL, APPACT_FILES, APPACT_MONITOR, APPACT_SPECTRUM, APPACT_SNAKE, APPACT_VNC, APPACT_REMOTE, APPACT_READER,
+  APPACT_TERMINAL, APPACT_FILES, APPACT_MONITOR, APPACT_PACKETS, APPACT_HEARD, APPACT_SPECTRUM, APPACT_SNAKE, APPACT_VNC, APPACT_REMOTE, APPACT_READER,
 };
 
 static void closeAppDrawer() {
@@ -35093,6 +36094,8 @@ static void appTileCb(lv_event_t* e) {
     case APPACT_CMDCENTER: setHomeDrawer(false);  return;   // explicit "back to command centre"
     case APPACT_SIGNAL:    openSignalInfoPopup(); return;   // signal/traffic + auto-discover settings
     case APPACT_MONITOR:   openMonitorPage();    return;   // RF activity graph + repeater-style radio stats
+    case APPACT_PACKETS:   openPacketsPage();    return;   // live per-frame RX list (type/route/hops/signal)
+    case APPACT_HEARD:     openHeardPage();      return;   // per-node advert list (signal/age/distance)
     case APPACT_SPECTRUM:  openSpectrumPage();   return;   // swept RF spectrum analyzer (borrows the radio)
 #if !defined(HAS_TANMATSU)
     case APPACT_VNC:       openVncPage();        return;   // screen mirror + remote control from a browser
@@ -35452,6 +36455,8 @@ static void openAppDrawer() {
 #endif
     { nullptr,             "Signal",    APPACT_SIGNAL,   0,         COLOR_ACCENT },  // theme (drawn signal bars)
     { TOUCH_SYM_ANTENNA,   "Monitor",   APPACT_MONITOR,  0,         0x35C9C9 },      // RF monitor cyan
+    { LV_SYMBOL_LIST,      "Packets",   APPACT_PACKETS,  0,         0x7FD1AE },      // per-frame RX list (mint — sits beside Monitor's cyan)
+    { LV_SYMBOL_AUDIO,     "Heard",     APPACT_HEARD,    0,         0x5FB0D8 },      // per-node advert list (sky — the Packets/Heard pair)
     { TOUCH_SYM_ANTENNA,   "Spectrum",  APPACT_SPECTRUM, 0,         0xE8A33D },      // RF spectrum analyzer amber
     { LV_SYMBOL_SETTINGS,  "Settings",  APPACT_SETTINGS, 0,         0x9AA3AD },      // neutral gear grey
 #if defined(HAS_TOUCH_UI)
@@ -35718,6 +36723,13 @@ static void docCaptureTour() {
 
   navGoToMainTab(HOME_TAB_INDEX); docSettle(3);
   openMonitorPage();  docSettle(14); captureScreenToSerial("app_rfmonitor"); closeMonitorPage();  docSettle(6);
+  openPacketsPage();  docSettle(14); captureScreenToSerial("app_packets");
+  // Decode the newest frame, if the radio has heard anything at all yet.
+  if (pktOpenDetailFor(0)) {
+    docSettle(14); captureScreenToSerial("app_packet_detail"); closePacketDetail(); docSettle(6);
+  }
+  closePacketsPage();  docSettle(6);
+  openHeardPage();    docSettle(14); captureScreenToSerial("app_heard");     closeHeardPage();    docSettle(6);
   openSpectrumPage(); docSettle(14); captureScreenToSerial("app_spectrum");  closeSpectrumPage(); docSettle(6);
   openRemotePage();   docSettle(14); captureScreenToSerial("app_remote");    closeRemotePage();   docSettle(6);
 #if defined(MULTI_TRANSPORT_COMPANION) && CAP_WEB_BROWSER
@@ -44033,6 +45045,9 @@ static const PopupEnt k_popup_registry[] = {
   { P_OPEN(s_urlmenu_root),          []{ closeUrlMenu(); },               PF_COUNT },   // chat URL -> action menu
   { P_OPEN(s_meminfo_root),          []{ closeMemInfo(); },               PF_COUNT },
   { P_OPEN(s_monitor_root),          []{ closeMonitorPage(); },           PF_COUNT },
+  { P_OPEN(s_pktdet_root),           []{ closePacketDetail(); },          PF_COUNT },   // above the list: Esc closes the detail first
+  { P_OPEN(s_packets_root),          []{ closePacketsPage(); },           PF_COUNT },
+  { P_OPEN(s_heard_root),            []{ closeHeardPage(); },             PF_COUNT },
   { P_OPEN(s_spec_root),             []{ closeSpectrumPage(); },          PF_COUNT },
   { P_OPEN(s_advert_root),           []{ closeAdvertPage(); },            PF_COUNT },   // was dismissable but never counted
 #if defined(HAS_EXPANSION_KIT)

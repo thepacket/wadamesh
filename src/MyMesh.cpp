@@ -1396,11 +1396,27 @@ void MyMesh::logRxRaw(float snr, float rssi, const uint8_t raw[], int len) {
   // with 4 transport-code bytes following iff route is a TRANSPORT_* one; the
   // next byte's low 6 bits are the path length. hops == 0 = heard DIRECTLY.
   uint8_t rt = 0, hops = 0;
+  int payload_off = len;               // == len when we can't locate a payload
   if (len > 0) {
     rt = raw[0] & 0x03;
     const bool xp = (rt == ROUTE_TYPE_TRANSPORT_FLOOD || rt == ROUTE_TYPE_TRANSPORT_DIRECT);
     const int  ps = 1 + (xp ? 4 : 0);
     hops = (ps < len) ? (uint8_t)(raw[ps] & 0x3F) : 0;
+    if (ps < len) {
+      // The path-length byte also carries the hop SIZE in its top 2 bits, so the
+      // payload starts past hop_count * hop_size bytes of path.
+      const int hsize = (raw[ps] >> 6) + 1;
+      const int po    = ps + 1 + hops * hsize;
+      if (po <= len) payload_off = po;
+    }
+  }
+  // Fingerprint the payload only — the path grows by a byte at every rebroadcast, so
+  // excluding it makes each flood copy of one message hash identically.
+  uint32_t payhash = 0;
+  if (len > 0 && payload_off < len) {
+    payhash = 2166136261u;
+    payhash = (payhash ^ (uint32_t)((raw[0] >> 2) & 0x0F)) * 16777619u;
+    for (int i = payload_off; i < len; i++) payhash = (payhash ^ raw[i]) * 16777619u;
   }
   // Live signal for the top-bar icon: ONLY from packets heard DIRECTLY (0-hop), so
   // the reading reflects a real direct-neighbour RF link, not the SNR of a repeater
@@ -1416,7 +1432,8 @@ void MyMesh::logRxRaw(float snr, float rssi, const uint8_t raw[], int len) {
   if (len > 0) {
     uiRxLogPush(now_ms, (int8_t)rssi, snr_q4,
                 (uint8_t)((raw[0] >> 2) & 0x0F), rt, hops,
-                (uint8_t)(len > 255 ? 255 : len));
+                (uint8_t)(len > 255 ? 255 : len),
+                getRTCClock()->getCurrentTime(), payhash, raw);
   }
 #if defined(DISPLAY_CLASS)
   // Diagnostic: log EVERY received frame so we can prove what reaches the
@@ -1814,6 +1831,15 @@ void MyMesh::onDiscoveredContact(ContactInfo &contact, bool is_new, uint8_t path
     p->recv_timestamp = getRTCClock()->getCurrentTime();
     p->path_len = path_len;
     memcpy(p->path, path, p->path_len);
+    // Signal for the Heard list. This runs synchronously inside the advert's own
+    // parse, so the radio still holds THIS packet's last-RX state.
+    p->snr_q   = (int8_t)(_radio->getLastSNR() * 4.0f);
+    p->rssi    = (int8_t)_radio->getLastRSSI();
+    // Type + position come from the advert we just parsed, NOT from a contact
+    // lookup — so an unsaved node still shows what it actually is and where.
+    p->type    = contact.type;
+    p->gps_lat = contact.gps_lat;
+    p->gps_lon = contact.gps_lon;
   }
 
   if (!is_new) dirty_contacts_expiry = futureMillis(LAZY_CONTACTS_WRITE_DELAY); // only schedule lazy write for contacts that are in contacts[]

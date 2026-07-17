@@ -121,6 +121,15 @@ struct AdvertPath {
   char    name[32];
   uint32_t recv_timestamp;
   uint8_t path[MAX_PATH_SIZE];
+  // ---- Heard app (see the Heard page in ui-touch) ----
+  // Captured at advert RX so a node can be judged without saving it first: how
+  // strong it landed, what it says it is, and where it says it is. All are
+  // "as advertised" — unverified beyond the advert's own signature.
+  int8_t  snr_q;      // SNR_dB * 4 as heard (0 = unknown)
+  int8_t  rssi;       // dBm as heard (0 = unknown)
+  uint8_t type;       // ADV_TYPE_* carried by the advert itself
+  int32_t gps_lat;    // advert position, 1e-6 deg (0 = not advertised)
+  int32_t gps_lon;
 };
 
 class MyMesh : public BaseChatMesh, public DataStoreHost {
@@ -481,39 +490,81 @@ public:
   int8_t   uiSignalRssi()  const { return _ui_sig_rssi; }
   uint32_t uiSignalMs()    const { return _ui_sig_ms; }
 
-  // ---- Recent-RX ring (RF Monitor app) ----
+  // ---- Recent-RX ring (RF Monitor + Packets apps) ----
   // One record per received frame, captured in logRxRaw(): payload type / route
   // / hop count / length + signal, so the Monitor page can show a live "what am
   // I hearing" feed without a core hook. Newest-first via uiRxLogGet (i=0 = most
   // recent). Board-independent — populated on every board, not just touch.
+  // The Packets app pages through the whole ring, so it holds more than the
+  // Monitor strip shows (that one caps itself at MON_FEED_ROWS).
   struct UiRxRec {
     uint32_t ms;        // millis() at RX
+    uint32_t epoch;     // RTC time at RX (0 = clock not set yet)
+    uint32_t payhash;   // FNV-1a over payload type + payload, PATH EXCLUDED, so every
+                        // flood copy of one message hashes alike -> "seen N copies"
     int8_t   rssi;      // dBm
     int8_t   snr_q4;    // SNR_dB * 4
     uint8_t  ptype;     // payload type  (raw[0]>>2)&0x0F
     uint8_t  route;     // route type    raw[0]&0x03
     uint8_t  hops;      // path length carried (0 = heard direct from origin)
-    uint8_t  len;       // frame length (clamped to 255)
+    uint8_t  len;       // frame length (MAX_TRANS_UNIT is 255, so this never truncates)
   };
-  static const int UI_RXLOG_MAX = 16;
+  static const int UI_RXLOG_MAX = 32;
+  // Full frame bytes per slot, so the Packets detail view can decode a packet long
+  // after it was heard. MAX_TRANS_UNIT is the on-air ceiling, so nothing is ever
+  // truncated and there is no partial-capture case to handle. Kept PARALLEL to the
+  // ring rather than inside UiRxRec so the list (which copies a record per row, per
+  // refresh) keeps moving 20-byte records instead of 275-byte ones.
+  // ~8 KB, and the_mesh is PSRAM-resident on ESP32 (see makeTheMesh in main.cpp).
+  static const int UI_RX_RAW = MAX_TRANS_UNIT;
+  uint8_t  _ui_rxraw[UI_RXLOG_MAX][UI_RX_RAW];
   UiRxRec  _ui_rxlog[UI_RXLOG_MAX];
   uint8_t  _ui_rxlog_head = 0;        // next write slot
   uint8_t  _ui_rxlog_cnt  = 0;        // valid entries (<= UI_RXLOG_MAX)
+  uint32_t _ui_rxlog_total = 0;       // frames ever pushed; wraps at 2^32 (~136 y at 1/s)
   uint8_t  uiRxLogCount() const { return _ui_rxlog_cnt; }
+  /** Monotonic count of frames ever logged. The Packets list rebuilds only when
+   *  this moves, so a quiet mesh costs no redraws. */
+  uint32_t uiRxLogTotal() const { return _ui_rxlog_total; }
   bool     uiRxLogGet(uint8_t i, UiRxRec& out) const {
     if (i >= _ui_rxlog_cnt) return false;
     uint8_t idx = (uint8_t)((_ui_rxlog_head + UI_RXLOG_MAX - 1 - i) % UI_RXLOG_MAX);
     out = _ui_rxlog[idx];
     return true;
   }
+  /** Raw bytes of the i-th newest frame (same index space as uiRxLogGet). Copies at
+   *  most out_sz; returns bytes copied. Read-only — safe from the UI. */
+  uint8_t uiRxLogRaw(uint8_t i, uint8_t* out, size_t out_sz) const {
+    if (i >= _ui_rxlog_cnt || !out || out_sz == 0) return 0;
+    uint8_t idx = (uint8_t)((_ui_rxlog_head + UI_RXLOG_MAX - 1 - i) % UI_RXLOG_MAX);
+    uint8_t n = _ui_rxlog[idx].len;
+    if (n > out_sz)    n = (uint8_t)out_sz;
+    if (n > UI_RX_RAW) n = UI_RX_RAW;
+    memcpy(out, _ui_rxraw[idx], n);
+    return n;
+  }
+  /** How many ring entries share this payhash — i.e. how many copies of one message
+   *  we heard, which for a flood is the rebroadcast count. */
+  uint8_t uiRxLogCopies(uint32_t payhash) const {
+    uint8_t n = 0;
+    for (uint8_t i = 0; i < _ui_rxlog_cnt; i++) {
+      uint8_t idx = (uint8_t)((_ui_rxlog_head + UI_RXLOG_MAX - 1 - i) % UI_RXLOG_MAX);
+      if (_ui_rxlog[idx].payhash == payhash) n++;
+    }
+    return n;
+  }
   // Record a reception into the ring (called from logRxRaw).
   void uiRxLogPush(uint32_t ms, int8_t rssi, int8_t snr_q4,
-                   uint8_t ptype, uint8_t route, uint8_t hops, uint8_t len) {
+                   uint8_t ptype, uint8_t route, uint8_t hops, uint8_t len,
+                   uint32_t epoch, uint32_t payhash, const uint8_t* raw) {
     UiRxRec& r = _ui_rxlog[_ui_rxlog_head];
     r.ms = ms; r.rssi = rssi; r.snr_q4 = snr_q4;
     r.ptype = ptype; r.route = route; r.hops = hops; r.len = len;
+    r.epoch = epoch; r.payhash = payhash;
+    if (raw && len) memcpy(_ui_rxraw[_ui_rxlog_head], raw, len > UI_RX_RAW ? UI_RX_RAW : len);
     _ui_rxlog_head = (uint8_t)((_ui_rxlog_head + 1) % UI_RXLOG_MAX);
     if (_ui_rxlog_cnt < UI_RXLOG_MAX) _ui_rxlog_cnt++;
+    _ui_rxlog_total++;
   }
 
   /** Fingerprint of the most-recently originated flood TXT payload (0 if none). */
@@ -626,6 +677,33 @@ public:
     strncpy(out, c->name, out_sz - 1);
     out[out_sz - 1] = '\0';
     return true;
+  }
+
+  /** Non-empty advert_paths slots. Cheap: no copy, and no qsort of the live table
+   *  (getRecentlyHeard sorts in place), so the Heard page can poll this to decide
+   *  whether a rebuild is even warranted. */
+  int uiHeardCount() const {
+    // sizeof, not ADVERT_PATH_TABLE_SIZE — that macro is defined further down this
+    // header, so it isn't expanded this early in the class body.
+    const int cap = (int)(sizeof(advert_paths) / sizeof(advert_paths[0]));
+    int n = 0;
+    for (int i = 0; i < cap; i++)
+      if (advert_paths[i].name[0] != '\0' || advert_paths[i].recv_timestamp != 0) n++;
+    return n;
+  }
+
+  /** Index of the saved contact matching this key prefix, or -1 if we haven't kept
+   *  it. The Heard list uses it both to tick saved nodes and to open the contact
+   *  card, which is keyed by index. Read-only scan. */
+  int uiContactIdxByPubKey(const uint8_t* pubkey, int prefix_len) {
+    if (!pubkey || prefix_len <= 0) return -1;
+    const int n = getNumContacts();
+    for (int i = 0; i < n; i++) {
+      ContactInfo c;
+      if (!getContactByIdx((uint32_t)i, c)) continue;
+      if (memcmp(c.id.pub_key, pubkey, (size_t)prefix_len) == 0) return i;
+    }
+    return -1;
   }
 
   /** Resolve a path-hop hash prefix to the repeater's advertised position.
