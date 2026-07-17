@@ -1646,11 +1646,18 @@ constexpr int DISCOVERED_MAX = 48;   // ring of recently-heard nodes not in cont
 struct LvDiscoveredEntry {
   bool used;
   bool in_contacts;
-  uint8_t path_len;
+  uint8_t path_len;        // ENCODED, as Packet defines it — see pathHopCount()
   uint32_t last_advert_ts;
   uint32_t recv_ms;
   ContactInfo ci;
 };
+// Packet::path_len is NOT a hop count: low 6 bits are the hop count, top 2 are the
+// hash size - 1 (Packet::getPathHashCount / getPathHashSize). A 2-hop path with
+// 3-byte hashes encodes as 130. Entries store the raw byte — and the "disc" NVS blob
+// has already persisted it that way — so decode at every USE rather than at capture;
+// that stays correct for entries written before this was fixed, and needs no blob
+// version bump (which would silently drop the user's whole Discovered list).
+static inline uint8_t pathHopCount(uint8_t path_len) { return (uint8_t)(path_len & 63); }
 // PSRAM-first allocator (falls back to internal RAM) for moving large static UI buffers off
 // the scarce internal SRAM. Safe as a static initializer: PSRAM is up before C++ ctors run,
 // and the fallback keeps the original internal behaviour if PSRAM is ever unavailable.
@@ -1757,7 +1764,14 @@ static void loadDiscovered() {
       e.ci.type         = *p++;
       e.ci.flags        = *p++;
       e.path_len        = *p++;
-      e.ci.out_path_len = e.path_len;
+      // out_path (the route TO this node) is deliberately not persisted, so there is
+      // no route to restore a length for. This used to copy the advert's INBOUND
+      // path_len here, which is both the wrong direction and an encoded byte, not a
+      // length — a 3-byte-hash 2-hop advert made it 130, i.e. a 130-byte route made
+      // of the zeroed out_path[]. Say "unknown" and let it flood until a real path is
+      // learned, which is what the core's populateContactFromAdvert does for a fresh
+      // advert.
+      e.ci.out_path_len = OUT_PATH_UNKNOWN;
       e.in_contacts     = (*p++ != 0);
       e.last_advert_ts  = discGetU32(p);
       e.ci.last_advert_timestamp = e.last_advert_ts;
@@ -1785,7 +1799,7 @@ static bool discoveredSweepHops() {
   if (maxhops == 0) return false;
   bool changed = false;
   for (int i = 0; i < DISCOVERED_MAX; ++i)
-    if (s_discovered[i].used && s_discovered[i].path_len > maxhops) {
+    if (s_discovered[i].used && pathHopCount(s_discovered[i].path_len) > maxhops) {
       s_discovered[i].used = false;
       changed = true;
     }
@@ -8917,7 +8931,7 @@ static void openDiscoveredModalCb(lv_event_t* e) {
     keyhex[8] = '\0';
     char meta_buf[64];
     snprintf(meta_buf, sizeof(meta_buf), "%s · %u hop · %s…",
-             type_label, (unsigned)e_disc.path_len, keyhex);
+             type_label, (unsigned)pathHopCount(e_disc.path_len), keyhex);
     lv_label_set_text(meta, meta_buf);
     lv_obj_set_style_text_color(meta, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
     lv_obj_set_style_text_font(meta, &g_font_12, LV_PART_MAIN);
@@ -17541,7 +17555,7 @@ static void webPushDiscovered() {
     if (!first) *p++ = ','; first = false;
     p += snprintf(p, e - p, "{\"i\":%d,\"rp\":%d,\"rm\":%d,\"pl\":%d,\"adv\":%u,\"la\":%ld,\"lo\":%ld,\"n\":\"",
                   i, (c.type == ADV_TYPE_REPEATER) ? 1 : 0, (c.type == ADV_TYPE_ROOM) ? 1 : 0,
-                  (int)s_discovered[i].path_len, (unsigned)s_discovered[i].last_advert_ts,
+                  (int)pathHopCount(s_discovered[i].path_len), (unsigned)s_discovered[i].last_advert_ts,
                   (long)c.gps_lat, (long)c.gps_lon);
     jsonEsc(p, e, c.name[0] ? c.name : "(unnamed)");
     p += snprintf(p, e - p, "\"}");
@@ -39982,7 +39996,7 @@ void UITask::discoveredContact(const ContactInfo& contact, bool is_new, uint8_t 
   // (0 = off). Drop the advert and remove any existing entry for this node.
   {
     const uint8_t maxhops = touchPrefsGetDiscoveredMaxHops();
-    if (maxhops > 0 && path_len > maxhops) {
+    if (maxhops > 0 && pathHopCount(path_len) > maxhops) {
       for (int i = 0; i < DISCOVERED_MAX; ++i)
         if (s_discovered[i].used &&
             memcmp(s_discovered[i].ci.id.pub_key, contact.id.pub_key, PUB_KEY_SIZE) == 0)
