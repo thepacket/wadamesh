@@ -2350,7 +2350,7 @@ static void refreshSensorsHistoryCharts();
 // Keyboard backlight: mode 0=off, 1=on, 2=auto (on while typing, off after idle).
 static uint8_t       s_kb_bl_mode    = 2;
 static unsigned long s_kb_last_key_ms = 0;
-constexpr unsigned long kKbBacklightIdleMs = 3000;   // auto: off 3 s after last key
+constexpr unsigned long kKbBacklightIdleMs = 8000;   // auto: off 8 s after last key
 // Register input activity (keypress / field focus / tap) for the auto backlight.
 static inline void noteKbActivity() { s_kb_last_key_ms = millis(); }
 #else
@@ -11486,7 +11486,7 @@ static void buildDeviceSettings(int sec) {
     y += SC(38);
   }
 #elif defined(HAS_PAGER_KEYBOARD)
-  /* Keyboard backlight: off / on / auto (lit while typing, dark after ~3 s idle).
+  /* Keyboard backlight: off / on / auto (lit while typing, dark after ~8 s idle).
      No brightness slider here (unlike the T-Deck) -- this board's backlight is a
      simple on/off strip, so there's nothing to dial in beyond the mode. */
   {
@@ -21778,19 +21778,18 @@ static void discoverBuildList() {
 
     // Name: resolve the key to a contact, else a hex placeholder. A dot marks a node
     // that answered THIS scan.
-    char nm[36];
     char resolved[24];
     if (!the_mesh.uiHopName(d.pub_key, 6, resolved, sizeof resolved))
       snprintf(resolved, sizeof resolved, "%02X%02X%02X%02X", d.pub_key[0], d.pub_key[1], d.pub_key[2], d.pub_key[3]);
+    // "Answered this scan" is shown by a GREEN name, not a prefix glyph — a leading
+    // U+25CF dot isn't in the UI font and rendered as a tofu rectangle.
     const bool fresh = (d.scan == scan);
-    snprintf(nm, sizeof nm, "%s%s", fresh ? "#6FCF6F \xE2\x97\x8F# " : "", resolved);
     lv_obj_t* nl = lv_label_create(row);
-    lv_label_set_recolor(nl, true);
-    lv_label_set_text(nl, nm);
+    lv_label_set_text(nl, resolved);
     lv_label_set_long_mode(nl, LV_LABEL_LONG_DOT);
     lv_obj_set_width(nl, LV_PCT(62));
     lv_obj_set_style_text_font(nl, &g_font_14, LV_PART_MAIN);
-    lv_obj_set_style_text_color(nl, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+    lv_obj_set_style_text_color(nl, lv_color_hex(fresh ? 0x6FCF6F : COLOR_TEXT), LV_PART_MAIN);
     lv_obj_align(nl, LV_ALIGN_TOP_LEFT, 0, 0);
 
     lv_obj_t* ty = lv_label_create(row);
