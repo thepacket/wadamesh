@@ -17,47 +17,22 @@ MeshCore fork via PlatformIO `lib_deps`.
 
 ## This fork (`thepacket/wadamesh`)
 
-A fork of [`ALLFATHER-BV/wadamesh`](https://github.com/ALLFATHER-BV/wadamesh) that
-adds an **operator-grade RF-diagnostics toolkit** on top of the base touch UI: apps
-for seeing exactly what the radio hears, who is in direct range, and how the mesh is
-carrying your traffic. Everything reads the tables the firmware already maintains (no
-extra radio load beyond the active Discover scan), lives in the app drawer, and works
-on every supported board.
+A fork of [`ALLFATHER-BV/wadamesh`](https://github.com/ALLFATHER-BV/wadamesh) built on
+`beta_46` that adds some additional tools on top of the base touch UI. Everything else
+(chat, map, contacts, channels, settings) is unchanged from beta_46.
 
-**New apps**
+**New**
 
-- **Packets** — a live, per-frame list of every frame the radio pulls out of the air
-  (type, route, hops, size, RSSI/SNR, colour-graded). Tap a frame to decode it: the
-  path with hop hashes resolved to names, per-type payload (channel plaintext where you
-  hold the key, advert name / type / position / clock-skew, trace hop SNRs), link
-  margin against the SF demod floor, airtime, and raw hex.
-- **Floods** — the same capture ring grouped by payload fingerprint, so flood
-  rebroadcasts collapse into one row: copies heard, hop spread, best signal. Answers
-  *"what is my mesh duplicating?"* — the right altitude for flood traffic.
-- **Heard** — one row per node whose advert you've received this session, with signal,
-  node type, hop count, age, and distance + bearing. Tap for the contact card.
-- **Discover** — an active, zero-hop scan: pings every node type and lists who answers,
-  with the SNR they heard *you* at (uplink) and the RSSI you heard *them* at (downlink),
-  strongest first. Responders are auto-added to contacts and named from adverts when
-  known. Client-side rate-limited so it stays within repeaters' discovery budgets.
+- **Packets** — live per-frame RX list (type, route, hops, size, RSSI/SNR, colour-graded). Tap a frame to decode it: path resolved to contact names, per-type payload (channel plaintext where you hold the key, advert name/type/position/clock-skew, trace hop SNRs), link margin, airtime, raw hex.
+- **Floods** — a Packets/Floods toggle grouping the capture ring by payload, so flood rebroadcasts collapse into one row: copies, hop spread, best signal.
+- **Heard** — one row per node whose advert you've received, with signal, type, hops, age, and distance + bearing.
+- **Discover** — active zero-hop scan; lists who answers with uplink SNR (how they heard you) and downlink RSSI (how you heard them). Answering nodes are auto-added to contacts and named from adverts. Rate-limited to respect repeater discovery budgets.
+- **Neighbours** (repeater sheet) — ask a repeater what *it* hears at its own antenna.
+- **Get name** (contact sheet) — pull a node's advertised name on demand, so a hex-placeholder contact gets its real name without waiting for its next advert.
 
-**New per-node actions** (contact / repeater action sheet)
+**Fixed**
 
-- **Neighbours** — ask a repeater what *it* hears at its own antenna
-  (`REQ_TYPE_GET_NEIGHBOURS`), as a monospace table of name / uplink SNR / age. Coverage
-  from the far end, which no other view shows.
-- **Get name** — pull a node's advertised name on demand (`REQ_TYPE_GET_OWNER_INFO`), so
-  a hex-placeholder contact gets its real name without waiting for its next advert.
-
-**Fixes** (back-portable to upstream): MeshCore's `path_len` is an *encoded* byte —
-hop count in the low 6 bits, hash size in the top 2 — not a length. Misreading it as a
-length silently dropped every multi-hop advert whose path used multi-byte hashes, both
-from the recent-heard table and the Discovered list. Fixed via the core's own
-`Packet::isValidPathLen` / `copyPath`.
-
-**Why this fork:** the base UI is an excellent everyday client; this turns it into a
-field diagnostic tool for operators who want to see the RF layer directly — link
-quality, coverage, flood redundancy, and who is actually reachable right now.
+- Adverts whose path uses multi-byte hashes are no longer dropped: `path_len` is an encoded byte (hop count + hash size), not a length — misreading it silently discarded multi-hop adverts from the recent-heard table and the Discovered list. Now decoded correctly.
 
 ## Boards
 

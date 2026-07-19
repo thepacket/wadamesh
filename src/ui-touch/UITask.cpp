@@ -21478,6 +21478,9 @@ static void heardAddRow(lv_obj_t* parent, const HeardRow& a, uint32_t now_secs,
   lv_label_set_text(nl, nm);
   lv_label_set_long_mode(nl, LV_LABEL_LONG_DOT);
   lv_obj_set_width(nl, LV_PCT(56));
+  // Pin to one line so LONG_DOT ellipsizes instead of wrapping — a long name wrapped
+  // to a 2nd line and overran the fixed-height row into the next one.
+  lv_obj_set_height(nl, lv_font_get_line_height(&g_font_14));
   lv_obj_set_style_text_font(nl, &g_font_14, LV_PART_MAIN);
   lv_obj_set_style_text_color(nl, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
   lv_obj_align(nl, LV_ALIGN_TOP_LEFT, 14, HEARD_Y_NAME);
@@ -21788,6 +21791,7 @@ static void discoverBuildList() {
     lv_label_set_text(nl, resolved);
     lv_label_set_long_mode(nl, LV_LABEL_LONG_DOT);
     lv_obj_set_width(nl, LV_PCT(62));
+    lv_obj_set_height(nl, lv_font_get_line_height(&g_font_14));   // one line -> ellipsize, don't wrap into the next row
     lv_obj_set_style_text_font(nl, &g_font_14, LV_PART_MAIN);
     lv_obj_set_style_text_color(nl, lv_color_hex(fresh ? 0x6FCF6F : COLOR_TEXT), LV_PART_MAIN);
     lv_obj_align(nl, LV_ALIGN_TOP_LEFT, 0, 0);

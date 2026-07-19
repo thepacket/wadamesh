@@ -1,0 +1,9 @@
+# beta_46-rf.2 — long-name fix
+
+A patch over beta_46-rf.1.
+
+# Fixed
+Long node names in Heard and Discover no longer wrap onto a second line and overrun the next row — they now truncate with an ellipsis on one line.
+
+# Other
+README: plainer description of the fork.
