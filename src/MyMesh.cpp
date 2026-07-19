@@ -2255,7 +2255,13 @@ void MyMesh::onContactResponse(const ContactInfo &contact, const uint8_t *data, 
     _ui_pending_status = 0;
     _ui_pending_kind = UiReqKind::None;
     _ui_pending_tag = 0;
-    if (kind == UiReqKind::Telemetry) {
+    if (kind == UiReqKind::Neighbours) {
+      // neighbours_count(2) results_count(2) then [prefix][age][snr] entries.
+      _ui->onNeighboursReply(contact, &data[4], (size_t)(len - 4));
+    } else if (kind == UiReqKind::OwnerInfo) {
+      // "FIRMWARE\nname\nowner" — the UI pulls the name (2nd line) into the contact.
+      _ui->onOwnerInfoReply(contact, &data[4], (size_t)(len - 4));
+    } else if (kind == UiReqKind::Telemetry) {
       // CayenneLPP payload — let the UI decode the LPP channels.
       _ui->onTelemetryReply(contact, &data[4], (size_t)(len - 4));
     } else {
@@ -2280,8 +2286,10 @@ void MyMesh::onContactResponse(const ContactInfo &contact, const uint8_t *data, 
     cancelUIDeferredLogin();
     if (login_ok) {
       ContactInfo& rc = const_cast<ContactInfo&>(contact);
-      if (k == UiReqKind::Telemetry) sendTelemetryRequestForUI(rc);
-      else                           sendStatusPingForUI(rc);
+      if (k == UiReqKind::Neighbours)     sendNeighboursRequestForUI(rc);
+      else if (k == UiReqKind::OwnerInfo) sendOwnerInfoRequestForUI(rc);
+      else if (k == UiReqKind::Telemetry) sendTelemetryRequestForUI(rc);
+      else                                sendStatusPingForUI(rc);
     }
     return;   // login frame consumed (OK fired the REQ; fail disarmed)
   }
@@ -2421,6 +2429,22 @@ bool MyMesh::onContactPathRecv(ContactInfo& contact, uint8_t* in_path, uint8_t i
 }
 
 void MyMesh::onControlDataRecv(mesh::Packet *packet) {
+  // Active-discovery reply (NODE_DISCOVER_RESP, high nibble 0x90): record the
+  // responder into the Discover list — full key + node type + the uplink SNR it
+  // reports, plus our downlink RSSI. Not tag-gated (any reply counts) and additive:
+  // the signal-probe capture below still runs, and the frame still relays to a
+  // connected companion app.
+  if ((packet->payload[0] & 0xF0) == CTL_TYPE_NODE_DISCOVER_RESP
+      && packet->payload_len >= 6 + PUB_KEY_SIZE) {
+    const uint8_t* pk   = &packet->payload[6];
+    const uint8_t  type = (uint8_t)(packet->payload[0] & 0x0F);
+    uiDiscRecord(pk, type, (int8_t)packet->payload[1], (int8_t)_radio->getLastRSSI());
+    // Auto-add every responder straight into contacts (placeholder hex name until its
+    // advert fills the real one). Schedules the same 5 s lazy write the advert path
+    // uses, so it survives reboot without a synchronous SD write per discovery.
+    if (uiAddDiscoveredContact(pk, type))
+      dirty_contacts_expiry = futureMillis(LAZY_CONTACTS_WRITE_DELAY);
+  }
   // Signal probe: a neighbouring repeater answered our zero-hop NODE_DISCOVER_REQ with a
   // NODE_DISCOVER_RESP. Capture OUR reception of that reply (SNR + RSSI) as the live
   // signal, matched by tag. This is the standard MeshCore node-discovery, the same packet

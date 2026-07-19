@@ -114,6 +114,8 @@
 #define REQ_TYPE_GET_STATUS             0x01 // same as _GET_STATS
 #define REQ_TYPE_KEEP_ALIVE             0x02
 #define REQ_TYPE_GET_TELEMETRY_DATA     0x03
+#define REQ_TYPE_GET_NEIGHBOURS         0x06 // ask a repeater for the nodes IT hears (simple_repeater handleRequest)
+#define REQ_TYPE_GET_OWNER_INFO         0x07 // ask a node for "FIRMWARE\nname\nowner" — used to fill a hex contact's name
 
 struct AdvertPath {
   uint8_t pubkey_prefix[7];
@@ -300,7 +302,7 @@ protected:
 public:
   /** Which kind of touch-UI request is currently in flight, so the response
    *  matcher in onContactResponse routes to the right callback. */
-  enum class UiReqKind : uint8_t { None = 0, Status = 1, Telemetry = 2 };
+  enum class UiReqKind : uint8_t { None = 0, Status = 1, Telemetry = 2, Neighbours = 3, OwnerInfo = 4 };
 
   /** Fire a REQ_TYPE_GET_STATUS from the touch UI side. Result is delivered
    *  via AbstractUITask::onPingReply when the reply arrives.
@@ -489,6 +491,122 @@ public:
   int8_t   uiSignalSnrQ4() const { return _ui_sig_snr_q4; }
   int8_t   uiSignalRssi()  const { return _ui_sig_rssi; }
   uint32_t uiSignalMs()    const { return _ui_sig_ms; }
+
+  // ---- Active node discovery (Discover app) ----
+  // The signal probe (above) is a link meter — one SNR reading, tag-gated. This is
+  // the mirror of meshcore-standalone's Discover: broadcast a zero-hop
+  // NODE_DISCOVER_REQ for EVERY node type, and record every node that answers into a
+  // list, so you get a live roster of who's in direct range. Distinct from the
+  // Contacts "Discovered" modal, which is passive (advert-fed). Recorded in
+  // onControlDataRecv on any 0x90 response — NOT tag-gated, so late replies still land.
+  struct DiscNode {
+    uint8_t  pub_key[32];   // full key (request asks prefix_only=0)
+    uint8_t  type;          // ADV_TYPE_* from the response's low nibble
+    int8_t   snr_q;         // SNR the responder heard OUR request at (uplink), ×4
+    int8_t   rssi;          // RSSI we heard the response at (downlink)
+    uint32_t ts;            // RTC secs we logged it
+    uint32_t scan;          // scan generation, to flag "new this scan"
+  };
+  static const int UI_DISC_MAX = 24;
+  DiscNode _ui_disc[UI_DISC_MAX];
+  int      _ui_disc_n    = 0;
+  uint32_t _ui_disc_scan = 0;   // bumped each Scan-now, stamped onto fresh entries
+  int      uiDiscCount() const { return _ui_disc_n; }
+  bool     uiDiscGet(int i, DiscNode& out) const {
+    if (i < 0 || i >= _ui_disc_n) return false;
+    out = _ui_disc[i]; return true;
+  }
+  uint32_t uiDiscScan() const { return _ui_disc_scan; }
+  void     uiClearDisc() { _ui_disc_n = 0; }
+
+  // Repeaters rate-limit discovery: simple_repeater is discover_limiter(4, 120) — max
+  // 4 responses per 2 min, then it goes silent for the rest of the window. So we floor
+  // our OWN request rate well under that (>=40 s apart, whatever the source: open,
+  // auto-poll, or a mashed Scan button) to stay a good citizen and not get starved.
+  static const uint32_t UI_DISC_MIN_MS = 40000;
+  uint32_t _ui_disc_last_send = 0;
+  /** ms until another discover may be sent (0 = ready now) — the UI uses it to tell
+   *  the user to wait instead of silently dropping a Scan tap. */
+  uint32_t uiDiscCooldownMs() const {
+    if (_ui_disc_last_send == 0) return 0;
+    uint32_t el = millis() - _ui_disc_last_send;
+    return (el >= UI_DISC_MIN_MS) ? 0 : (UI_DISC_MIN_MS - el);
+  }
+
+  /** Broadcast a zero-hop NODE_DISCOVER_REQ for every node type; responders land in
+   *  _ui_disc via onControlDataRecv. Bumps the scan generation so the UI can badge
+   *  the ones that answer this round. Returns true if the request went out, false if
+   *  throttled (still inside the min interval) or the packet pool was empty. */
+  bool uiSendNodeDiscover() {
+    if (uiDiscCooldownMs() != 0) return false;   // too soon — protect the repeater budget
+    _ui_disc_last_send = millis();
+    _ui_disc_scan++;
+    uint8_t data[6];
+    data[0] = 0x80;   // CTL_TYPE_NODE_DISCOVER_REQ, prefix_only=0 -> full keys
+    data[1] = (uint8_t)((1 << ADV_TYPE_CHAT) | (1 << ADV_TYPE_REPEATER) |
+                        (1 << ADV_TYPE_ROOM) | (1 << ADV_TYPE_SENSOR));
+    uint32_t tag; getRNG()->random((uint8_t*)&tag, 4);
+    memcpy(&data[2], &tag, 4);
+    mesh::Packet* pkt = createControlData(data, sizeof(data));
+    if (!pkt) return false;
+    sendZeroHop(pkt);
+    return true;
+  }
+
+  /** Record a NODE_DISCOVER_RESP responder (upsert by key, evict oldest when full).
+   *  Called from onControlDataRecv; not tag-gated. rssi is our downlink reception. */
+  void uiDiscRecord(const uint8_t* pub_key, uint8_t type, int8_t snr_q, int8_t rssi) {
+    int slot = -1;
+    for (int k = 0; k < _ui_disc_n; k++)
+      if (memcmp(_ui_disc[k].pub_key, pub_key, 32) == 0) { slot = k; break; }
+    if (slot < 0) {
+      if (_ui_disc_n < UI_DISC_MAX) slot = _ui_disc_n++;
+      else { uint32_t oldest = 0xFFFFFFFF; slot = 0;
+             for (int k = 0; k < _ui_disc_n; k++) if (_ui_disc[k].ts < oldest) { oldest = _ui_disc[k].ts; slot = k; } }
+    }
+    memcpy(_ui_disc[slot].pub_key, pub_key, 32);
+    _ui_disc[slot].type  = type;
+    _ui_disc[slot].snr_q = snr_q;
+    _ui_disc[slot].rssi  = rssi;
+    _ui_disc[slot].ts    = getRTCClock()->getCurrentTime();
+    _ui_disc[slot].scan  = _ui_disc_scan;
+  }
+
+  /** Add a discovered responder to contacts. On the touch build discovery does NOT
+   *  auto-add (matching meshcore-standalone's LVGL two-tier model), so the Discover
+   *  UI calls this on tap. Placeholder hex name until the node's advert arrives and
+   *  onAdvertRecv fills the real one; flood-routed until a path is learned. Returns
+   *  false if it's already a contact (or the table is full). Caller persists. */
+  /** If we've already heard this key advertise, its friendly name is in advert_paths
+   *  (the Heard table, keyed by 7-byte prefix). Copy it out; returns false if unknown,
+   *  so the caller can fall back to a hex placeholder. */
+  bool uiNameForKey(const uint8_t* pub_key, char* out, size_t out_sz) const {
+    if (!pub_key || !out || out_sz == 0) return false;
+    const int cap = (int)(sizeof(advert_paths) / sizeof(advert_paths[0]));
+    for (int i = 0; i < cap; i++) {
+      if (advert_paths[i].name[0] == '\0') continue;
+      if (memcmp(advert_paths[i].pubkey_prefix, pub_key, sizeof(advert_paths[i].pubkey_prefix)) == 0) {
+        strncpy(out, advert_paths[i].name, out_sz - 1);
+        out[out_sz - 1] = '\0';
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool uiAddDiscoveredContact(const uint8_t* pub_key, uint8_t type) {
+    if (!pub_key || lookupContactByPubKey(pub_key, PUB_KEY_SIZE) != NULL) return false;
+    ContactInfo c; memset(&c, 0, sizeof(c));
+    memcpy(c.id.pub_key, pub_key, PUB_KEY_SIZE);
+    c.type = type;
+    c.out_path_len = OUT_PATH_UNKNOWN;
+    // Use the real name if we've already heard this node's advert; else a hex
+    // placeholder that the core's onAdvertRecv upgrades on the next advert.
+    if (!uiNameForKey(pub_key, c.name, sizeof(c.name)))
+      snprintf(c.name, sizeof(c.name), "%02X%02X%02X%02X", pub_key[0], pub_key[1], pub_key[2], pub_key[3]);
+    c.lastmod = getRTCClock()->getCurrentTime();
+    return addContact(c);
+  }
 
   // ---- Recent-RX ring (RF Monitor + Packets apps) ----
   // One record per received frame, captured in logRxRaw(): payload type / route
@@ -804,6 +922,58 @@ public:
       _ui_pending_tag  = tag;   // request tag, reflected by the repeater
     }
     return r;
+  }
+
+  /** Ask a repeater for the nodes IT hears at its own antenna (REQ_TYPE_GET_NEIGHBOURS).
+   *  Unlike the Heard list — what WE hear — this is coverage from the repeater's
+   *  vantage. Uses the body form of sendRequest to carry the query params the
+   *  simple_repeater responder expects (version, count, offset, order, prefix len,
+   *  uniqueness blob). Reply lands in AbstractUITask::onNeighboursReply, matched by
+   *  the reflected tag exactly like status/telemetry. */
+  int sendNeighboursRequestForUI(ContactInfo& recipient) {
+    uint8_t req[11];
+    req[0] = REQ_TYPE_GET_NEIGHBOURS;
+    req[1] = 0;                              // request_version
+    req[2] = 16;                             // count — as many as the 130-byte reply fits (~11)
+    req[3] = 0; req[4] = 0;                  // offset (uint16 LE) = 0
+    req[5] = 2;                              // order_by = strongest_to_weakest
+    req[6] = 6;                              // pubkey_prefix_length — 6, enough to resolve a contact
+    getRNG()->random(&req[7], 4);            // uniqueness blob (payload[7..10])
+    uint32_t tag = 0, est = 0;
+    int r = sendRequest(recipient, req, sizeof(req), tag, est);
+    if (r == MSG_SEND_SENT_FLOOD || r == MSG_SEND_SENT_DIRECT) {
+      memcpy(&_ui_pending_status, recipient.id.pub_key, 4);
+      _ui_pending_kind = UiReqKind::Neighbours;
+      _ui_pending_tag  = tag;
+    }
+    return r;
+  }
+
+  /** Ask a node for its owner info ("FIRMWARE\nname\nowner"). The touch UI uses it to
+   *  fill in a hex-placeholder contact's real name on demand, instead of waiting for
+   *  the node's next advert. Reply lands in AbstractUITask::onOwnerInfoReply. */
+  int sendOwnerInfoRequestForUI(ContactInfo& recipient) {
+    uint32_t tag = 0, est = 0;
+    int r = sendRequest(recipient, REQ_TYPE_GET_OWNER_INFO, tag, est);
+    if (r == MSG_SEND_SENT_FLOOD || r == MSG_SEND_SENT_DIRECT) {
+      memcpy(&_ui_pending_status, recipient.id.pub_key, 4);
+      _ui_pending_kind = UiReqKind::OwnerInfo;
+      _ui_pending_tag  = tag;
+    }
+    return r;
+  }
+
+  /** Set a contact's name by key (Get-name flow updates it from the owner-info reply).
+   *  Schedules the lazy write. Returns false if there's no such contact. */
+  bool uiSetContactName(const uint8_t* pub_key, const char* name) {
+    if (!pub_key || !name || !name[0]) return false;
+    ContactInfo* c = lookupContactByPubKey(pub_key, PUB_KEY_SIZE);
+    if (!c) return false;
+    strncpy(c->name, name, sizeof(c->name) - 1);
+    c->name[sizeof(c->name) - 1] = '\0';
+    c->lastmod = getRTCClock()->getCurrentTime();
+    dirty_contacts_expiry = futureMillis(5000);
+    return true;
   }
 
 private:

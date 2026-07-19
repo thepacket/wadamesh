@@ -134,6 +134,19 @@ public:
   virtual void onTelemetryReply(const ContactInfo& contact, const uint8_t* data, size_t len) {
     onPingReply(contact, data, len);
   }
+  /** Notify UI of a GET_NEIGHBOURS reply: the nodes the repeater hears at its own
+   *  antenna. Payload is neighbours_count(u16) results_count(u16) then a run of
+   *  [pubkey_prefix(6)][heard_seconds_ago(u32)][snr_q4(int8)] entries. Default is a
+   *  no-op — only the touch UI renders it. */
+  virtual void onNeighboursReply(const ContactInfo& contact, const uint8_t* data, size_t len) {
+    (void)contact; (void)data; (void)len;
+  }
+  /** Notify UI of a GET_OWNER_INFO reply: "FIRMWARE\nname\nowner". The touch UI pulls
+   *  the node name (2nd line) into the contact so a hex placeholder gets a real name
+   *  on demand. Default no-op. */
+  virtual void onOwnerInfoReply(const ContactInfo& contact, const uint8_t* data, size_t len) {
+    (void)contact; (void)data; (void)len;
+  }
   /** Admin-login finished. `success=true` means the repeater accepted the
    *  password and added us to its ACL; `perms` is the granted permission
    *  bitmask (e.g. PERM_ACL_ADMIN | PERM_ACL_GUEST). On `success=false` the

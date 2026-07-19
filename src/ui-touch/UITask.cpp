@@ -15096,6 +15096,8 @@ static void actionSheetLosCb(lv_event_t* e) {
 #endif  // ESP32 && MULTI_TRANSPORT_COMPANION
 
 static void actionSheetShowOnMapCb(lv_event_t* e);   // defined with the map code (uses map statics)
+static void actionSheetNeighboursCb(lv_event_t* e);  // defined with the neighbours window, below
+static void actionSheetGetNameCb(lv_event_t* e);     // defined with the neighbours window, below
 static void openContactActionSheet(uint32_t mesh_idx, bool is_repeater, const char* name, bool from_map = false) {
   s_action_sheet_mesh_idx = mesh_idx;
   s_action_sheet_is_repeater = is_repeater;
@@ -15279,11 +15281,13 @@ static void openContactActionSheet(uint32_t mesh_idx, bool is_repeater, const ch
     mk_btn(LV_SYMBOL_ENVELOPE "  Message", actionSheetSendMsgCb, 0);
   }
   mk_btn(LV_SYMBOL_BATTERY_3 "  Telemetry", actionSheetTelemetryCb, 0);
+  mk_btn(LV_SYMBOL_DOWNLOAD "  Get name", actionSheetGetNameCb, 0);   // pull the node's advertised name on demand
   if (has_map_btn)
     mk_btn(LV_SYMBOL_GPS "  Show on map", actionSheetShowOnMapCb, 0);
   if (is_repeater) {
-    mk_btn(LV_SYMBOL_GPS      "  Trace SNR", actionSheetTracePingCb, 0);
-    mk_btn(LV_SYMBOL_SETTINGS "  Admin",     actionSheetAdminCb,     0);
+    mk_btn(LV_SYMBOL_GPS      "  Trace SNR",  actionSheetTracePingCb, 0);
+    mk_btn(LV_SYMBOL_LIST     "  Neighbours", actionSheetNeighboursCb, 0);   // what THIS repeater hears
+    mk_btn(LV_SYMBOL_SETTINGS "  Admin",      actionSheetAdminCb,     0);
   }
   mk_btn(LV_SYMBOL_WIFI "  Range test", actionSheetRangeTestCb, 0);
 #if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
@@ -21668,6 +21672,268 @@ static void openHeardPage() {
   heardBuildList();
   s_heard_timer = lv_timer_create(heardTimerCb, 2000, nullptr);
   lv_obj_move_foreground(s_heard_root);
+  lv_obj_move_foreground(g_statusbar.root);
+}
+
+// ============================================================
+// Discover app  (app-drawer tile -> APPACT_DISCOVER)
+// ============================================================
+// Active roster of who is in DIRECT range. Tap Scan and every node type is asked to
+// identify (zero-hop NODE_DISCOVER_REQ); each that answers lands in the list with the
+// SNR it heard us at (uplink) and the RSSI we heard it at (downlink). Distinct from
+// three neighbours: Heard is passive advert traffic, the Contacts "Discovered" modal
+// is passive too, and the signal probe is a one-number link meter. This is an active
+// ping that enumerates direct neighbours — the mirror of meshcore-standalone's Discover.
+// Zero-hop by nature, so it only sees nodes you can reach without a relay.
+static lv_obj_t*   s_disc_root  = nullptr;
+static lv_obj_t*   s_disc_list  = nullptr;
+static lv_obj_t*   s_disc_status = nullptr;
+static lv_timer_t* s_disc_timer = nullptr;
+static int         s_disc_last_n = -1;
+static uint32_t    s_disc_last_build = 0;
+static uint32_t    s_disc_scan_at = 0;    // millis() of the last auto-scan
+
+static void closeDiscoverPage();
+static void discoverBuildList();
+
+static int discCmpSnr(const void* a, const void* b) {
+  return ((const MyMesh::DiscNode*)b)->snr_q - ((const MyMesh::DiscNode*)a)->snr_q;   // strongest first
+}
+
+// Per-row tap target: full key + type, filled at build time so a tap survives the
+// list re-sorting underneath it (the DiscNode list upserts and the view sorts by SNR).
+struct DiscAppAddCtx { uint8_t key[32]; uint8_t type; };
+static DiscAppAddCtx s_discapp_add_ctx[MyMesh::UI_DISC_MAX];
+
+// Tap a discovered node: open its card if it's already a contact, otherwise add it —
+// discovery doesn't auto-add on the touch build (manual, per the two-tier model), and
+// wadamesh has no directory to promote from, so the tap IS the add.
+static void discoverRowClickedCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED || !g_lv.task) return;
+  lv_indev_t* a = lv_indev_get_act(); if (a) lv_indev_wait_release(a);
+  const DiscAppAddCtx* ctx = static_cast<const DiscAppAddCtx*>(lv_event_get_user_data(e));
+  if (!ctx) return;
+  const int idx = the_mesh.uiContactIdxByPubKey(ctx->key, 6);
+  if (idx >= 0) {   // already saved -> its card
+    ContactInfo c;
+    if (the_mesh.getContactByIdx((uint32_t)idx, c))
+      openContactActionSheet((uint32_t)idx, c.type == ADV_TYPE_REPEATER, c.name);
+    return;
+  }
+  if (the_mesh.uiAddDiscoveredContact(ctx->key, ctx->type)) {
+    the_mesh.uiPersistContacts();   // survive reboot
+    refreshContactsList();
+    g_lv.task->showAlert(TR("Added to contacts"), 1000);
+    discoverBuildList();            // the row now shows resolved + card-on-tap
+  } else {
+    g_lv.task->showAlert(TR("Already a contact"), 1000);
+  }
+}
+
+static void discoverBuildList() {
+  if (!s_disc_list) return;
+  const lv_coord_t keep_y = lv_obj_get_scroll_y(s_disc_list);
+  lv_obj_clean(s_disc_list);
+
+  const int n = the_mesh.uiDiscCount();
+  if (n == 0) {
+    lv_obj_t* e = lv_label_create(s_disc_list);
+    lv_label_set_text(e, TR("No replies yet \xE2\x80\x94 tap Scan"));
+    lv_obj_set_style_text_font(e, &g_font_12, LV_PART_MAIN);
+    lv_obj_set_style_text_color(e, lv_color_hex(0x5A6166), LV_PART_MAIN);
+    s_disc_last_n = 0; s_disc_last_build = millis();
+    return;
+  }
+
+  // Snapshot + sort strongest-first (uplink SNR).
+  static MyMesh::DiscNode* snap =
+    (MyMesh::DiscNode*)psAlloc(sizeof(MyMesh::DiscNode) * MyMesh::UI_DISC_MAX);
+  int m = 0;
+  for (int i = 0; i < n && m < MyMesh::UI_DISC_MAX; i++)
+    if (the_mesh.uiDiscGet(i, snap[m])) m++;
+  if (m > 1) qsort(snap, m, sizeof(snap[0]), discCmpSnr);
+
+  const bool narrow = lv_disp_get_hor_res(nullptr) < 280;
+  const uint32_t now_secs = the_mesh.getRTCClock()->getCurrentTime();
+  const uint32_t scan = the_mesh.uiDiscScan();
+  for (int i = 0; i < m; i++) {
+    const MyMesh::DiscNode& d = snap[i];
+    lv_obj_t* row = lv_obj_create(s_disc_list);
+    lv_obj_remove_style_all(row);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+    // Fill this row's tap context (bounded by UI_DISC_MAX, one per row).
+    memcpy(s_discapp_add_ctx[i].key, d.pub_key, 32);
+    s_discapp_add_ctx[i].type = d.type;
+    lv_obj_add_event_cb(row, discoverRowClickedCb, LV_EVENT_CLICKED, &s_discapp_add_ctx[i]);
+    lv_obj_set_width(row, LV_PCT(100));
+    lv_obj_set_height(row, 44);
+    lv_obj_set_style_bg_color(row, lv_color_hex(COLOR_PANEL), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(row, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_color(row, lv_color_hex(0x18191A), LV_PART_MAIN);
+    lv_obj_set_style_border_width(row, 1, LV_PART_MAIN);
+    lv_obj_set_style_radius(row, 6, LV_PART_MAIN);
+    lv_obj_set_style_pad_hor(row, 8, LV_PART_MAIN);
+    lv_obj_set_style_pad_ver(row, 5, LV_PART_MAIN);
+
+    // Name: resolve the key to a contact, else a hex placeholder. A dot marks a node
+    // that answered THIS scan.
+    char nm[36];
+    char resolved[24];
+    if (!the_mesh.uiHopName(d.pub_key, 6, resolved, sizeof resolved))
+      snprintf(resolved, sizeof resolved, "%02X%02X%02X%02X", d.pub_key[0], d.pub_key[1], d.pub_key[2], d.pub_key[3]);
+    const bool fresh = (d.scan == scan);
+    snprintf(nm, sizeof nm, "%s%s", fresh ? "#6FCF6F \xE2\x97\x8F# " : "", resolved);
+    lv_obj_t* nl = lv_label_create(row);
+    lv_label_set_recolor(nl, true);
+    lv_label_set_text(nl, nm);
+    lv_label_set_long_mode(nl, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(nl, LV_PCT(62));
+    lv_obj_set_style_text_font(nl, &g_font_14, LV_PART_MAIN);
+    lv_obj_set_style_text_color(nl, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+    lv_obj_align(nl, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    lv_obj_t* ty = lv_label_create(row);
+    lv_label_set_text(ty, TR(advTypeName(d.type)));
+    lv_obj_set_style_text_font(ty, &g_font_12, LV_PART_MAIN);
+    lv_obj_set_style_text_color(ty, lv_color_hex(advTypeColor(d.type)), LV_PART_MAIN);
+    lv_obj_align(ty, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+
+    // uplink SNR (how well the node heard us) leads — that's what "in range" means.
+    uint32_t age = (now_secs > d.ts && d.ts != 0) ? now_secs - d.ts : 0;
+    char age_s[8];
+    if (age < 60) snprintf(age_s, sizeof age_s, "%lus", (unsigned long)age);
+    else if (age < 3600) snprintf(age_s, sizeof age_s, "%lum", (unsigned long)(age/60));
+    else snprintf(age_s, sizeof age_s, "%luh", (unsigned long)(age/3600));
+    lv_obj_t* ag = lv_label_create(row);
+    lv_label_set_text(ag, age_s);
+    lv_obj_set_style_text_font(ag, &g_font_12, LV_PART_MAIN);
+    lv_obj_set_style_text_color(ag, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+    lv_obj_align(ag, LV_ALIGN_TOP_RIGHT, 0, 0);
+
+    char sig[40];
+    const double up = (double)d.snr_q / 4.0;
+    snprintf(sig, sizeof sig, narrow ? "\xE2\x86\x91%.1f  %d" : "\xE2\x86\x91%.1f dB  \xE2\x86\x93%d dBm",
+             up, (int)d.rssi);
+    uint32_t col = (d.snr_q/4 >= 5) ? 0x6FCF6F : (d.snr_q/4 >= 0 ? 0xC9A227 : 0xE0533D);
+    lv_obj_t* sg = lv_label_create(row);
+    lv_label_set_text(sg, sig);
+    lv_obj_set_style_text_font(sg, &g_font_12, LV_PART_MAIN);
+    lv_obj_set_style_text_color(sg, lv_color_hex(col), LV_PART_MAIN);
+    lv_obj_align(sg, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+  }
+  lv_obj_scroll_to_y(s_disc_list, keep_y, LV_ANIM_OFF);
+  s_disc_last_n = n;
+  s_disc_last_build = millis();
+}
+
+static void discoverScanCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  lv_indev_t* a = lv_indev_get_act(); if (a) lv_indev_wait_release(a);
+  const uint32_t cd = the_mesh.uiDiscCooldownMs();
+  if (cd != 0) {
+    // Repeaters cap discovery at 4 / 2 min; tell the user to wait rather than burn it.
+    char msg[40]; snprintf(msg, sizeof msg, TR("Wait %lus \xE2\x80\x94 repeaters rate-limit"), (unsigned long)((cd + 999) / 1000));
+    if (g_lv.task) g_lv.task->showAlert(msg, 1400);
+    return;
+  }
+  the_mesh.uiSendNodeDiscover();
+  s_disc_scan_at = millis();
+  if (s_disc_status) lv_label_set_text(s_disc_status, TR("Scanning\xE2\x80\xA6"));
+}
+
+static void discoverTimerCb(lv_timer_t* t) {
+  (void)t;
+  if (!s_disc_list) return;
+  // Re-scan on a 60s cadence like meshcore-standalone, and rebuild when the roster
+  // grows or every 5s so ages/fresh-dots stay honest.
+  if (millis() - s_disc_scan_at >= 60000UL) { the_mesh.uiSendNodeDiscover(); s_disc_scan_at = millis(); }
+  if (the_mesh.uiDiscCount() != s_disc_last_n || (millis() - s_disc_last_build) >= 5000UL) {
+    discoverBuildList();
+    if (s_disc_status) {
+      char st[40]; snprintf(st, sizeof st, TR("%d in range"), the_mesh.uiDiscCount());
+      lv_label_set_text(s_disc_status, st);
+    }
+  }
+}
+
+static void discoverDismissCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  if (lv_event_get_target(e) != lv_event_get_current_target(e)) return;
+  lv_indev_t* a = lv_indev_get_act(); if (a) lv_indev_wait_release(a);
+  closeDiscoverPage();
+}
+
+static void closeDiscoverPage() {
+  if (s_disc_timer) { lv_timer_del(s_disc_timer); s_disc_timer = nullptr; }
+  if (s_disc_root)  { popupClose(&s_disc_root); }
+  s_disc_list = nullptr; s_disc_status = nullptr; s_disc_last_n = -1;
+  if (s_apppage_close == closeDiscoverPage) {
+    s_apppage_title = nullptr; s_apppage_close = nullptr;
+    statusBarSetTall(false); updateGlobalStatusBar();
+  }
+}
+
+static void openDiscoverPage() {
+  closeDiscoverPage();
+  const lv_coord_t sw = lv_disp_get_hor_res(nullptr);
+  const lv_coord_t sh = lv_disp_get_ver_res(nullptr);
+  const int H = sh - STATUSBAR_H;
+  s_disc_root = lv_obj_create(lv_layer_top());
+  lv_obj_remove_style_all(s_disc_root);
+  lv_obj_set_size(s_disc_root, sw, H);
+  lv_obj_set_pos(s_disc_root, 0, STATUSBAR_H);
+  lv_obj_set_style_bg_color(s_disc_root, lv_color_hex(COLOR_BG), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(s_disc_root, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_clear_flag(s_disc_root, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_event_cb(s_disc_root, discoverDismissCb, LV_EVENT_CLICKED, nullptr);
+
+  s_apppage_title = "Discover";
+  s_apppage_close = closeDiscoverPage;
+  statusBarSetTall(true);
+  updateGlobalStatusBar();
+  const int top = STATUSBAR_H + 8;
+
+  s_disc_status = lv_label_create(s_disc_root);
+  lv_label_set_text(s_disc_status, TR("\xE2\x86\x91 uplink SNR  \xC2\xB7  \xE2\x86\x93 our RSSI"));
+  lv_obj_set_style_text_font(s_disc_status, &g_font_12, LV_PART_MAIN);
+  lv_obj_set_style_text_color(s_disc_status, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+  lv_obj_set_pos(s_disc_status, 10, top + 2);
+
+  // Scan chip, right-aligned, same idiom as the Heard sort chip.
+  lv_obj_t* chip = lv_obj_create(s_disc_root);
+  lv_obj_remove_style_all(chip);
+  lv_obj_add_flag(chip, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_set_size(chip, 66, 20);
+  lv_obj_set_pos(chip, sw - 76, top - 2);
+  lv_obj_set_style_bg_color(chip, lv_color_hex(COLOR_PANEL), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(chip, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_radius(chip, 10, LV_PART_MAIN);
+  lv_obj_set_style_border_color(chip, lv_color_hex(0x18191A), LV_PART_MAIN);
+  lv_obj_set_style_border_width(chip, 1, LV_PART_MAIN);
+  lv_obj_add_event_cb(chip, discoverScanCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* cl = lv_label_create(chip);
+  lv_label_set_text(cl, TR("Scan"));
+  lv_obj_set_style_text_font(cl, &g_font_12, LV_PART_MAIN);
+  lv_obj_set_style_text_color(cl, lv_color_hex(COLOR_ACCENT), LV_PART_MAIN);
+  lv_obj_center(cl);
+
+  const int list_y = top + 22;
+  s_disc_list = lv_obj_create(s_disc_root);
+  lv_obj_remove_style_all(s_disc_list);
+  lv_obj_set_pos(s_disc_list, 10, list_y);
+  lv_obj_set_size(s_disc_list, sw - 20, H - list_y - 6);
+  lv_obj_set_style_bg_opa(s_disc_list, LV_OPA_TRANSP, LV_PART_MAIN);
+  lv_obj_set_scroll_dir(s_disc_list, LV_DIR_VER);
+  lv_obj_set_scrollbar_mode(s_disc_list, LV_SCROLLBAR_MODE_AUTO);
+  lv_obj_set_flex_flow(s_disc_list, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(s_disc_list, 4, LV_PART_MAIN);
+
+  discoverBuildList();
+  the_mesh.uiSendNodeDiscover();    // kick a scan on open
+  s_disc_scan_at = millis();
+  s_disc_timer = lv_timer_create(discoverTimerCb, 1000, nullptr);
+  lv_obj_move_foreground(s_disc_root);
   lv_obj_move_foreground(g_statusbar.root);
 }
 
@@ -36045,7 +36311,7 @@ static void openControlCenter() {
 enum AppDrawerAction {
   APPACT_CHATS, APPACT_CONTACTS, APPACT_MAP, APPACT_SETTINGS,
   APPACT_ADVERT, APPACT_POWER, APPACT_MENTIONS, APPACT_CMDCENTER, APPACT_SIGNAL,
-  APPACT_TERMINAL, APPACT_FILES, APPACT_MONITOR, APPACT_PACKETS, APPACT_HEARD, APPACT_SPECTRUM, APPACT_SNAKE, APPACT_VNC, APPACT_REMOTE, APPACT_READER,
+  APPACT_TERMINAL, APPACT_FILES, APPACT_MONITOR, APPACT_PACKETS, APPACT_HEARD, APPACT_DISCOVER, APPACT_SPECTRUM, APPACT_SNAKE, APPACT_VNC, APPACT_REMOTE, APPACT_READER,
 };
 
 static void closeAppDrawer() {
@@ -36291,6 +36557,7 @@ static void appTileCb(lv_event_t* e) {
     case APPACT_MONITOR:   openMonitorPage();    return;   // RF activity graph + repeater-style radio stats
     case APPACT_PACKETS:   openPacketsPage();    return;   // live per-frame RX list (type/route/hops/signal)
     case APPACT_HEARD:     openHeardPage();      return;   // per-node advert list (signal/age/distance)
+    case APPACT_DISCOVER:  openDiscoverPage();   return;   // active zero-hop node discovery (who's in direct range)
     case APPACT_SPECTRUM:  openSpectrumPage();   return;   // swept RF spectrum analyzer (borrows the radio)
 #if !defined(HAS_TANMATSU)
     case APPACT_VNC:       openVncPage();        return;   // screen mirror + remote control from a browser
@@ -36652,6 +36919,7 @@ static void openAppDrawer() {
     { TOUCH_SYM_ANTENNA,   "Monitor",   APPACT_MONITOR,  0,         0x35C9C9 },      // RF monitor cyan
     { LV_SYMBOL_LIST,      "Packets",   APPACT_PACKETS,  0,         0x7FD1AE },      // per-frame RX list (mint — sits beside Monitor's cyan)
     { LV_SYMBOL_AUDIO,     "Heard",     APPACT_HEARD,    0,         0x5FB0D8 },      // per-node advert list (sky — the Packets/Heard pair)
+    { LV_SYMBOL_WIFI,      "Discover",  APPACT_DISCOVER, 0,         0x53C06B },      // active zero-hop node scan (green — reaching out)
     { TOUCH_SYM_ANTENNA,   "Spectrum",  APPACT_SPECTRUM, 0,         0xE8A33D },      // RF spectrum analyzer amber
     { LV_SYMBOL_SETTINGS,  "Settings",  APPACT_SETTINGS, 0,         0x9AA3AD },      // neutral gear grey
 #if defined(HAS_TOUCH_UI)
@@ -36930,6 +37198,7 @@ static void docCaptureTour() {
   }
   closePacketsPage();  docSettle(6);
   openHeardPage();    docSettle(14); captureScreenToSerial("app_heard");     closeHeardPage();    docSettle(6);
+  openDiscoverPage(); docSettle(14); captureScreenToSerial("app_discover");  closeDiscoverPage(); docSettle(6);
   openSpectrumPage(); docSettle(14); captureScreenToSerial("app_spectrum");  closeSpectrumPage(); docSettle(6);
   openRemotePage();   docSettle(14); captureScreenToSerial("app_remote");    closeRemotePage();   docSettle(6);
 #if defined(MULTI_TRANSPORT_COMPANION) && CAP_WEB_BROWSER
@@ -40494,6 +40763,239 @@ static void telemClearConfirmed() {
 static void telemClearCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
   showConfirm(TR("Clear telemetry history for this node?"), TR("Clear"), telemClearConfirmed);
+}
+
+// ============================================================
+// Neighbours window  (contact action sheet -> "Neighbours")
+// ============================================================
+// Ask a repeater what IT hears at its own antenna (REQ_TYPE_GET_NEIGHBOURS). The
+// mirror of the Heard app: Heard is what WE hear, this is the repeater's own view,
+// so you can judge its coverage from where it sits. Rendered as a monospace table —
+// the columns (SNR, age) align on their own, which cards can't do.
+static lv_obj_t*  s_neigh_root  = nullptr;
+static lv_obj_t*  s_neigh_list  = nullptr;   // the rows container, repopulated on reply
+static lv_timer_t* s_neigh_timeout = nullptr;
+static uint8_t    s_neigh_node[6] = {0};
+static char       s_neigh_name[24] = {0};
+static const uint32_t NEIGH_TIMEOUT_MS = 30000;   // flood RTT can be slow; match the ping budget
+
+static void closeNeighboursWindow() {
+  if (s_neigh_timeout) { lv_timer_del(s_neigh_timeout); s_neigh_timeout = nullptr; }
+  if (s_neigh_root)    { popupClose(&s_neigh_root); }
+  s_neigh_list = nullptr;
+}
+static void neighboursDismissCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  if (lv_event_get_target(e) != lv_event_get_current_target(e)) return;
+  lv_indev_t* a = lv_indev_get_act(); if (a) lv_indev_wait_release(a);
+  closeNeighboursWindow();
+}
+
+// Replace the list body with a single status line (requesting / failed / empty).
+static void neighboursShowStatus(const char* msg, uint32_t col) {
+  if (!s_neigh_list) return;
+  lv_obj_clean(s_neigh_list);
+  lv_obj_t* l = lv_label_create(s_neigh_list);
+  lv_label_set_text(l, msg);
+  lv_obj_set_style_text_font(l, &g_font_12, LV_PART_MAIN);
+  lv_obj_set_style_text_color(l, lv_color_hex(col), LV_PART_MAIN);
+}
+
+static void neighboursTimeoutCb(lv_timer_t* t) {
+  (void)t;
+  s_neigh_timeout = nullptr;   // one-shot
+  neighboursShowStatus(TR("No reply \xE2\x80\x94 repeater didn't answer"), 0xE0533D);
+}
+
+// One monospace row: name padded to a fixed width, then SNR and age columns line up.
+static void neighboursAddRow(const char* name, double snr_db, uint32_t age_s) {
+  if (!s_neigh_list) return;
+  char age[8];
+  if (age_s < 60)         snprintf(age, sizeof age, "%lus", (unsigned long)age_s);
+  else if (age_s < 3600)  snprintf(age, sizeof age, "%lum", (unsigned long)(age_s / 60));
+  else                    snprintf(age, sizeof age, "%luh", (unsigned long)(age_s / 3600));
+  char nm[13];                                   // pad/truncate to 12 monospace cells
+  snprintf(nm, sizeof nm, "%-12.12s", name);
+  char line[40];
+  snprintf(line, sizeof line, "%s %+5.1f  %4s", nm, snr_db, age);
+  lv_obj_t* l = lv_label_create(s_neigh_list);
+  lv_label_set_text(l, line);
+  lv_obj_set_style_text_font(l, &lv_font_unscii_8, LV_PART_MAIN);   // monospace: columns self-align
+  // Grade the SNR the same green/amber/red as the Heard dot.
+  uint32_t col = COLOR_TEXT;
+  if      (snr_db >= 5.0) col = 0x6FCF6F;
+  else if (snr_db >= 0.0) col = 0xC9A227;
+  else                    col = 0xE0533D;
+  lv_obj_set_style_text_color(l, lv_color_hex(col), LV_PART_MAIN);
+}
+
+void UITask::onNeighboursReply(const ContactInfo& contact, const uint8_t* data, size_t len) {
+  (void)contact;
+  if (s_neigh_timeout) { lv_timer_del(s_neigh_timeout); s_neigh_timeout = nullptr; }
+  if (!s_neigh_root || !s_neigh_list) return;   // window closed before the reply landed
+  if (!data || len < 4) { neighboursShowStatus(TR("Empty reply"), 0x9AA0A6); return; }
+
+  uint16_t total = 0, results = 0;
+  memcpy(&total, &data[0], 2);
+  memcpy(&results, &data[2], 2);
+  lv_obj_clean(s_neigh_list);
+
+  // Column header, same monospace font so it lines up with the rows.
+  lv_obj_t* hd = lv_label_create(s_neigh_list);
+  lv_label_set_text(hd, "NODE          SNR   AGE");
+  lv_obj_set_style_text_font(hd, &lv_font_unscii_8, LV_PART_MAIN);
+  lv_obj_set_style_text_color(hd, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+
+  const int ENTRY = 6 + 4 + 1;   // prefix(6) + heard_seconds_ago(u32) + snr(int8)
+  size_t off = 4;
+  int shown = 0;
+  for (int i = 0; i < results && off + ENTRY <= len; i++, off += ENTRY) {
+    const uint8_t* pfx = &data[off];
+    uint32_t age; memcpy(&age, &data[off + 6], 4);
+    int8_t snr_q4 = (int8_t)data[off + 10];      // ×4, per NeighbourInfo
+    char nm[24];
+    if (!the_mesh.uiHopName(pfx, 6, nm, sizeof nm)) {   // resolve to a contact, else hex prefix
+      snprintf(nm, sizeof nm, "%02X%02X%02X", pfx[0], pfx[1], pfx[2]);
+    }
+    neighboursAddRow(nm, (double)snr_q4 / 4.0, age);
+    shown++;
+  }
+  if (shown == 0) { neighboursShowStatus(TR("Repeater hears no neighbours"), 0x9AA0A6); return; }
+
+  // Footer when the repeater knows more than fit in one reply.
+  if (total > shown) {
+    char more[40];
+    snprintf(more, sizeof more, TR("+%d more (showing strongest %d)"), total - shown, shown);
+    lv_obj_t* f = lv_label_create(s_neigh_list);
+    lv_label_set_text(f, more);
+    lv_obj_set_style_text_font(f, &g_font_12, LV_PART_MAIN);
+    lv_obj_set_style_text_color(f, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+  }
+}
+
+static void openNeighboursWindow(const uint8_t* key6, const char* name) {
+  closeNeighboursWindow();
+  if (key6) memcpy(s_neigh_node, key6, 6);
+  if (name) { strncpy(s_neigh_name, name, sizeof s_neigh_name - 1); s_neigh_name[sizeof s_neigh_name - 1] = '\0'; }
+
+  const lv_coord_t sw = lv_disp_get_hor_res(nullptr);
+  const lv_coord_t sh = lv_disp_get_ver_res(nullptr);
+  s_neigh_root = lv_obj_create(lv_layer_top());
+  lv_obj_remove_style_all(s_neigh_root);
+  lv_obj_set_size(s_neigh_root, sw, sh - STATUSBAR_H);
+  lv_obj_set_pos(s_neigh_root, 0, STATUSBAR_H);
+  lv_obj_set_style_bg_color(s_neigh_root, lv_color_black(), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(s_neigh_root, LV_OPA_50, LV_PART_MAIN);
+  lv_obj_clear_flag(s_neigh_root, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_event_cb(s_neigh_root, neighboursDismissCb, LV_EVENT_CLICKED, nullptr);
+
+  lv_obj_t* card = lv_obj_create(s_neigh_root);
+  lv_obj_remove_style_all(card);
+  lv_obj_set_size(card, sw - 16, sh - STATUSBAR_H - 12);
+  lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 6);
+  styleSurface(card, COLOR_PANEL, 8);
+  lv_obj_set_style_border_color(card, lv_color_hex(0x18191A), LV_PART_MAIN);
+  lv_obj_set_style_border_width(card, 1, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(card, 10, LV_PART_MAIN);
+  lv_obj_set_scroll_dir(card, LV_DIR_VER);
+  addCloseXBadge(card, neighboursDismissCb);
+
+  char ttl[40];
+  snprintf(ttl, sizeof ttl, "%.20s", s_neigh_name[0] ? s_neigh_name : "repeater");
+  lv_obj_t* t = lv_label_create(card);
+  lv_label_set_text(t, ttl);
+  lv_obj_set_style_text_font(t, &g_font_14, LV_PART_MAIN);
+  lv_obj_set_style_text_color(t, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+  lv_obj_align(t, LV_ALIGN_TOP_LEFT, 0, 0);
+  lv_obj_t* sub = lv_label_create(card);
+  lv_label_set_text(sub, TR("neighbours heard at its antenna"));
+  lv_obj_set_style_text_font(sub, &g_font_12, LV_PART_MAIN);
+  lv_obj_set_style_text_color(sub, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+  lv_obj_align(sub, LV_ALIGN_TOP_LEFT, 0, 18);
+
+  s_neigh_list = lv_obj_create(card);
+  lv_obj_remove_style_all(s_neigh_list);
+  lv_obj_set_width(s_neigh_list, LV_PCT(100));
+  lv_obj_set_flex_grow(s_neigh_list, 1);
+  lv_obj_align(s_neigh_list, LV_ALIGN_TOP_LEFT, 0, 40);
+  lv_obj_set_height(s_neigh_list, sh - STATUSBAR_H - 12 - 58);
+  lv_obj_set_style_bg_opa(s_neigh_list, LV_OPA_TRANSP, LV_PART_MAIN);
+  lv_obj_set_scroll_dir(s_neigh_list, LV_DIR_VER);
+  lv_obj_set_scrollbar_mode(s_neigh_list, LV_SCROLLBAR_MODE_AUTO);
+  lv_obj_set_flex_flow(s_neigh_list, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(s_neigh_list, 3, LV_PART_MAIN);
+
+  neighboursShowStatus(TR("Requesting\xE2\x80\xA6"), COLOR_ACCENT);
+  lv_obj_move_foreground(s_neigh_root);
+
+  // Deferred guest-login-then-request (see uiSendRequestAfterGuestLogin): a repeater
+  // drops a REQ from a sender it hasn't ACL'd yet, so send the blank LOGIN now and
+  // let onContactResponse fire the neighbours REQ once we're in the ACL.
+  ContactInfo c;
+  if (the_mesh.getContactByIdx(s_action_sheet_mesh_idx, c) &&
+      memcmp(c.id.pub_key, s_neigh_node, 6) == 0) {
+    the_mesh.uiSendRequestAfterGuestLogin(c, MyMesh::UiReqKind::Neighbours);
+  } else {
+    // Fall back to a direct lookup by prefix if the sheet index moved.
+    ContactInfo* cp = the_mesh.lookupContactByPubKey(s_neigh_node, 6);
+    if (cp) the_mesh.uiSendRequestAfterGuestLogin(*cp, MyMesh::UiReqKind::Neighbours);
+  }
+  s_neigh_timeout = lv_timer_create(neighboursTimeoutCb, NEIGH_TIMEOUT_MS, nullptr);
+}
+
+static void actionSheetNeighboursCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED || !g_lv.task) return;
+  lv_indev_t* a = lv_indev_get_act(); if (a) lv_indev_wait_release(a);
+  ContactInfo c;
+  bool ok = the_mesh.getContactByIdx(s_action_sheet_mesh_idx, c);
+  closeActionSheet();
+  if (!ok) { g_lv.task->showAlert(TR("Contact gone"), 1200); return; }
+  openNeighboursWindow(c.id.pub_key, c.name);
+}
+
+// "Get name": ask a node for its owner info and rename the contact from the reply, so
+// a hex-placeholder contact (e.g. auto-added from Discover) gets its real name on
+// demand rather than waiting for the node's next advert. Key stored so the reply,
+// which arrives async, updates the right contact even if the sheet has closed.
+static uint8_t s_getname_key[32] = {0};
+static bool    s_getname_pending = false;
+
+void UITask::onOwnerInfoReply(const ContactInfo& contact, const uint8_t* data, size_t len) {
+  s_ui_ping_deadline_ms = 0;   // reply arrived, cancel the timeout
+  s_getname_pending = false;
+  // Payload is "FIRMWARE\nname\nowner"; the node name is the 2nd line.
+  const char* s = (const char*)data;
+  size_t i = 0;
+  while (i < len && s[i] != '\n') i++;          // skip firmware line
+  if (i >= len) { showAlert(TR("No name in reply"), 1600); return; }
+  i++;                                          // past the first newline
+  char name[32]; int n = 0;
+  while (i < len && s[i] != '\n' && n < (int)sizeof(name) - 1) name[n++] = s[i++];
+  name[n] = '\0';
+  if (n == 0) { showAlert(TR("No name in reply"), 1600); return; }
+  if (the_mesh.uiSetContactName(contact.id.pub_key, name)) {
+    the_mesh.uiPersistContacts();
+    refreshContactsList();
+    char msg[48]; snprintf(msg, sizeof msg, "%s: %.24s", TR("Named"), name);
+    showAlert(msg, 1500);
+  } else {
+    showAlert(TR("Contact gone"), 1400);
+  }
+}
+
+static void actionSheetGetNameCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED || !g_lv.task) return;
+  lv_indev_t* a = lv_indev_get_act(); if (a) lv_indev_wait_release(a);
+  ContactInfo c;
+  bool ok = the_mesh.getContactByIdx(s_action_sheet_mesh_idx, c);
+  closeActionSheet();
+  if (!ok) { g_lv.task->showAlert(TR("Contact gone"), 1200); return; }
+  memcpy(s_getname_key, c.id.pub_key, 32);
+  s_getname_pending = true;
+  // Guest-login-then-request, like the other repeater requests: the node needs us in
+  // its ACL before it decrypts the REQ (see uiSendRequestAfterGuestLogin).
+  the_mesh.uiSendRequestAfterGuestLogin(c, MyMesh::UiReqKind::OwnerInfo);
+  g_lv.task->showAlert(TR("Requesting name\xE2\x80\xA6"), 1200);
 }
 
 static void openTelemetryWindow(const uint8_t* key6, const char* name, int state) {
@@ -45248,6 +45750,7 @@ static const PopupEnt k_popup_registry[] = {
   { P_OPEN(s_pktdet_root),           []{ closePacketDetail(); },          PF_COUNT },   // above the list: Esc closes the detail first
   { P_OPEN(s_packets_root),          []{ closePacketsPage(); },           PF_COUNT },
   { P_OPEN(s_heard_root),            []{ closeHeardPage(); },             PF_COUNT },
+  { P_OPEN(s_disc_root),             []{ closeDiscoverPage(); },          PF_COUNT },
   { P_OPEN(s_spec_root),             []{ closeSpectrumPage(); },          PF_COUNT },
   { P_OPEN(s_advert_root),           []{ closeAdvertPage(); },            PF_COUNT },   // was dismissable but never counted
 #if defined(HAS_EXPANSION_KIT)
@@ -45274,6 +45777,7 @@ static const PopupEnt k_popup_registry[] = {
 #if CAP_SD
   { P_OPEN(s_telem_config_root),     []{ telemetryConfigClose(); },       PF_COUNT },   // sits on the telemetry window
   { P_OPEN(s_telemetry_root),        []{ telemetryClose(); },             PF_COUNT },
+  { P_OPEN(s_neigh_root),            []{ closeNeighboursWindow(); },      PF_COUNT },
 #endif
 #if defined(HAS_TDECK_GT911)
   { P_OPEN(s_lockwall_picker),       []{ lockwallPickerClose(); },        PF_COUNT },
