@@ -1,0 +1,19 @@
+# beta_46-rf.1 — RF-diagnostics fork: Packets, Floods, Heard, Discover, Neighbours
+
+This is the first beta of thepacket/wadamesh, a fork of ALLFATHER-BV/wadamesh built
+on beta_46. It adds an operator-grade RF-diagnostics toolkit on top of the base touch
+UI: apps for seeing exactly what the radio hears, who is in direct range, and how the
+mesh is carrying your traffic. Everything else — chat, map, contacts, channels,
+settings — is unchanged from beta_46.
+
+# New
+Packets app: a live, per-frame list of every frame the radio pulls out of the air (type, route, hops, size, RSSI/SNR, colour-graded by signal). Tap a frame to decode it — the path with hop hashes resolved to contact names, per-type payload (channel plaintext where you hold the key, advert name/type/position/clock-skew, trace hop SNRs), link margin against the spreading-factor floor, airtime, and raw hex.
+Floods view: a Packets/Floods toggle that groups the capture ring by payload, so flood rebroadcasts collapse into one row — copies heard, hop spread, best signal. Shows what your mesh is duplicating.
+Heard app: one row per node whose advert you've received this session, with signal, node type, hop count, age, and distance + bearing. Tap for the contact card.
+Discover app: an active zero-hop scan — pings every node type and lists who answers, with the SNR they heard you at (uplink) and the RSSI you heard them at (downlink), strongest first, this-scan responders in green. Answering nodes are auto-added to contacts and named from adverts when known. Client-side rate-limited so it stays within repeaters' discovery budgets.
+Neighbours (repeater contact sheet): ask a repeater what it hears at its own antenna, as a monospace table of name / uplink SNR / age — coverage from the far end.
+Get name (contact sheet): pull a node's advertised name on demand, so a hex-placeholder contact gets its real name without waiting for its next advert.
+
+# Fixed
+Adverts whose path uses multi-byte hashes are no longer dropped: path_len is an encoded byte (hop count + hash size), not a length, and misreading it as a length silently discarded every multi-hop advert on a mesh using multi-byte hashes — from the recent-heard table and from the Discovered list (which also rendered "130 hop" and could auto-delete those nodes under a hop limit). Now decoded correctly.
+Keyboard backlight (auto mode) stays lit 8 seconds after the last key, up from 3.
