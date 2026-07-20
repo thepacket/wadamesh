@@ -40834,10 +40834,16 @@ static void telemClearCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
   showConfirm(TR("Clear telemetry history for this node?"), TR("Clear"), telemClearConfirmed);
 }
+#endif  // CAP_SD — end of the SD-backed telemetry poll/load block
 
 // ============================================================
 // Neighbours window  (contact action sheet -> "Neighbours")
 // ============================================================
+// NOT SD-backed — the Neighbours + "Get name" features are pure mesh/LVGL and
+// their callbacks (actionSheetNeighboursCb / actionSheetGetNameCb) and reply
+// overrides (onNeighboursReply / onOwnerInfoReply) are referenced unconditionally,
+// so they must compile on every board — including the no-SD Heltec V4 TFT. Kept
+// out of the CAP_SD gate above; the SD-backed telemetry window resumes below.
 // Ask a repeater what IT hears at its own antenna (REQ_TYPE_GET_NEIGHBOURS). The
 // mirror of the Heard app: Heard is what WE hear, this is the repeater's own view,
 // so you can judge its coverage from where it sits. Rendered as a monospace table —
@@ -41068,6 +41074,7 @@ static void actionSheetGetNameCb(lv_event_t* e) {
   g_lv.task->showAlert(TR("Requesting name\xE2\x80\xA6"), 1200);
 }
 
+#if CAP_SD   // telemetry window + config resume here — SD-backed (T-Deck only)
 static void openTelemetryWindow(const uint8_t* key6, const char* name, int state) {
   if (s_telemetry_root) { popupClose(&s_telemetry_root); }
   s_telem_now_ta = s_telem_past_ta = nullptr;
