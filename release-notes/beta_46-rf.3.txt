@@ -1,0 +1,9 @@
+# beta_46-rf.3 — on-screen keyboard for the T-Deck
+
+A feature release over beta_46-rf.2.
+
+# New
+On-screen keyboard (T-Deck): an optional touch keyboard for when the mechanical keyboard is unreliable. Turn it on in Settings -> Keyboard -> "On-screen keyboard" (off by default, remembered across reboots). With it on, tapping a text field pops up the same on-screen keyboard the touch-only boards use — accent picker, secondary layouts, and all. It overlaps the field, with the text you're typing mirrored in a strip at the top. The physical keyboard keeps working alongside it. Opening a chat only focuses the message field for the hardware keys; the on-screen keyboard appears only when you actually tap the field.
+
+# Fixed
+Build: the Neighbours and "Get name" features were compiled out on boards without an SD card (the Heltec V4 TFT) even though they're used everywhere, which broke that build. They're pure mesh/UI features and nothing to do with SD, so they now build on every board. No change on boards that already had them.
