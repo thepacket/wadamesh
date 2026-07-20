@@ -406,6 +406,8 @@ uint8_t touchPrefsGetKbdBacklight();
 void    touchPrefsSetKbdBacklight(uint8_t pct);
 bool    touchPrefsGetEnterSends();             // Enter key sends a chat message (default true)
 void    touchPrefsSetEnterSends(bool on);
+bool    touchPrefsGetOsk();                     // on-screen keyboard on a physical-keyboard + touch board (T-Deck), default false
+void    touchPrefsSetOsk(bool on);
 bool    touchPrefsGetClock12h();               // 12-hour clock (default false = 24h)
 void    touchPrefsSetClock12h(bool on);
 bool    touchPrefsGetNavMenubarKeys();         // show per-tab nav hotkey letters over the menubar (default false = hidden)

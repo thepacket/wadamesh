@@ -1579,16 +1579,30 @@ static lv_obj_t* s_kb_mirror_root = nullptr;
 static lv_obj_t* s_kb_mirror_ta = nullptr;
 /** Real textarea whose text is synced with `s_kb_mirror_ta` while the keyboard is open. */
 static lv_obj_t* s_kb_bind_ta = nullptr;
-// The T-Deck has a physical keyboard and never shows the on-screen keyboard or
-// the (hidden) mirror strip, so its keys bind STRAIGHT to the visible field —
-// the mirror indirection only exists for boards with an on-screen keyboard.
-// Routing the T-Deck through the mirror made every edit act at the mirror's
-// end-cursor, so backspace deleted the last character no matter where the caret
-// was. When this returns false, kbMirrorBind binds the field directly and the
-// mirror sync / redirects below are skipped.
+
+// On-screen keyboard (OSK) opt-in. A physical-keyboard board that ALSO has a
+// touchscreen (the T-Deck) can show the same on-screen keyboard the touch-only
+// boards use — handy when the mechanical keyboard is unreliable. Off by default;
+// loaded from the pref at boot (see begin()) and toggled live from
+// Settings -> Keyboard. Always false on boards that lack either a physical
+// keyboard or a touchscreen, so those keep their existing behaviour unchanged.
+#if CAP_KEYBOARD && CAP_TOUCH
+static bool s_osk_enabled = false;
+static inline bool oskEnabled() { return s_osk_enabled; }
+#else
+static inline bool oskEnabled() { return false; }
+#endif
+
+// A physical-keyboard board normally binds its keys STRAIGHT to the visible field
+// (no mirror strip, no on-screen keys): routing the T-Deck through the mirror made
+// every edit act at the mirror's end-cursor, so backspace deleted the last
+// character no matter where the caret was. So the mirror indirection is only used
+// on boards that show an on-screen keyboard — the touch-only boards, or a T-Deck
+// whose user opted the OSK on. When this returns false, kbMirrorBind binds the
+// field directly and the mirror sync / redirects below are skipped.
 static inline bool kbMirrorActive() {
 #if CAP_KEYBOARD
-  return false;   // physical keyboard: bind keys straight to the field, never show the on-screen kb
+  return oskEnabled();   // physical keyboard: mirror + on-screen keys only when the user turned the OSK on
 #else
   return true;
 #endif
@@ -4323,7 +4337,12 @@ static void accentExit();      // long-press accent picker (issue #22, dead on t
 static void accentBoxHide();   // tap-to-pick accent box (issue #22)
 static void mentionBoxHide();  // tap-to-pick @-mention contact picker (issue #42)
 static void txtMenuHide();     // cut/copy/paste/select-all edit menu
-static void showKb(LvChatPanel* p);
+// pop_osk: whether to actually raise the on-screen keyboard (keys + composer lift).
+// Touch-only boards default true — they've no hardware keyboard, so opening a chat
+// shows the keys. Physical-keyboard boards (T-Deck) default FALSE: opening a chat
+// focuses the composer for the hardware keys but must NOT auto-pop the OSK — only a
+// deliberate tap of the composer does (see composerEditClickedCb).
+static void showKb(LvChatPanel* p, bool pop_osk = !CAP_KEYBOARD);
 static void closeSettingsModal();
 static void contactSelectCb(lv_event_t* e);
 static double contactDistanceKm(double lat1, double lon1, double lat2, double lon2);
@@ -5383,9 +5402,9 @@ static void kbMirrorBind(lv_obj_t* real_ta) {
   lv_obj_add_event_cb(real_ta, kbBoundTaDeletedCb, LV_EVENT_DELETE, nullptr);
 
   lv_keyboard_set_textarea(g_lv.keyboard, s_kb_mirror_ta);
-#if !CAP_KEYBOARD
-  // T-Deck has a physical keyboard — the mirror/keys never show; the typed text
-  // syncs straight into the (visible) real field. Other boards show both.
+  // Only reached when kbMirrorActive() is true — a touch-only board, or a T-Deck
+  // whose user opted the on-screen keyboard on. A physical-keyboard board with the
+  // OSK off returned early above and binds keys straight to the visible field.
   lv_obj_clear_flag(s_kb_mirror_root, LV_OBJ_FLAG_HIDDEN);
   lv_obj_move_foreground(s_kb_mirror_root);
   // Slide the mirror BELOW the settings modal header (when one is open)
@@ -5401,7 +5420,6 @@ static void kbMirrorBind(lv_obj_t* real_ta) {
   lv_obj_move_foreground(g_lv.keyboard);
   kbApplyRotation(effectiveKbRotation());
   kbShowRotateArrows(true);
-#endif
 }
 
 static void hideKb() {
@@ -5462,7 +5480,7 @@ static void popupClose(lv_obj_t** root) {
   *root = nullptr;
 }
 
-static void showKb(LvChatPanel* p) {
+static void showKb(LvChatPanel* p, bool pop_osk) {
   if (!g_lv.keyboard || !p || !p->composer_ta || !p->msgs || !p->composer_row) return;
   kbMirrorSyncToReal();
   s_kb_bind_ta = nullptr;
@@ -5475,17 +5493,19 @@ static void showKb(LvChatPanel* p) {
   // routes here via handleHwKey; this just makes the cursor visible so the user
   // can see the field is ready).
   lv_obj_add_state(p->composer_ta, LV_STATE_FOCUSED);
-#if !CAP_KEYBOARD
-  // No on-screen keyboard on the T-Deck — the physical keyboard types straight
-  // into the composer (already visible), so skip showing the keys + the lift.
-  lv_obj_clear_flag(g_lv.keyboard, LV_OBJ_FLAG_HIDDEN);
-  lv_obj_move_foreground(g_lv.keyboard);
-  // Shrink message area to keep composer visible above keyboard.
-  lv_obj_set_height(p->msgs,         chatMsgHKb());
-  lv_obj_set_y(p->composer_row,      chatCompYKb());
-  kbApplyRotation(effectiveKbRotation());
-  kbShowRotateArrows(true);
-#endif
+  // On a physical-keyboard board with the OSK off, kbMirrorActive() is false: the
+  // keyboard types straight into the (already visible) composer, so skip showing
+  // the keys + the lift. Touch-only boards — and a T-Deck with the OSK opted on and
+  // the composer deliberately tapped (pop_osk) — show the keys and lift the composer.
+  if (kbMirrorActive() && pop_osk) {
+    lv_obj_clear_flag(g_lv.keyboard, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(g_lv.keyboard);
+    // Shrink message area to keep composer visible above keyboard.
+    lv_obj_set_height(p->msgs,         chatMsgHKb());
+    lv_obj_set_y(p->composer_row,      chatCompYKb());
+    kbApplyRotation(effectiveKbRotation());
+    kbShowRotateArrows(true);
+  }
 }
 
 // The composer wraps long messages to multiple lines and grows UPWARD instead
@@ -7921,6 +7941,16 @@ static void composerEditClickedCb(lv_event_t* e) {
   } else {
     s_sel_ta = nullptr;            // a single tap moved the cursor -> drop the sticky selection
   }
+#if CAP_KEYBOARD && CAP_TOUCH
+  // Physical-keyboard board with the OSK opted on: a deliberate tap of the chat
+  // composer is what raises the on-screen keyboard. (Opening a chat only focuses
+  // the composer for the hardware keys — showKb's default pop_osk=false there — so
+  // the OSK stays down until the user actually taps the field.) user_data is the
+  // panel for the chat composer, null for settings fields (those pop via
+  // settingsFieldFocusCb -> kbMirrorBind on their own tap).
+  auto* p = static_cast<LvChatPanel*>(lv_event_get_user_data(e));
+  if (p && oskEnabled()) { showKb(p, /*pop_osk=*/true); noteKbActivity(); }
+#endif
 }
 
 static void composerEditLongPressCb(lv_event_t* e) {
@@ -10238,6 +10268,23 @@ static void enterSendsToggleCb(lv_event_t* e) {
   if (g_lv.task) g_lv.task->showAlert(on ? TR("Enter sends messages") : TR("Enter adds a new line"), 1200);
 }
 
+#if CAP_KEYBOARD && CAP_TOUCH
+// On-screen keyboard opt-in (Settings -> Keyboard). Flips the same runtime switch
+// (kbMirrorActive) the touch-only boards are always on: when enabled, tapping a
+// text field pops the on-screen keys + top mirror strip. Applied live — turning it
+// off tears down any keyboard currently up so the field returns to its resting layout.
+static void oskToggleCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  const bool on = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+  s_osk_enabled = on;
+#if defined(ESP32)
+  touchPrefsSetOsk(on);
+#endif
+  if (!on) hideKb();   // dismiss any on-screen keyboard that's currently up
+  if (g_lv.task) g_lv.task->showAlert(on ? TR("On-screen keyboard on") : TR("On-screen keyboard off"), 1200);
+}
+#endif
+
 // New-message notify flash (opt-in): the T-Deck analog of the Tanmatsu envelope LED. On a new
 // message we wake the screen and briefly pulse the keyboard backlight. The statics below are set
 // here / in notify() and consumed in the loop()'s keyboard-backlight tick.
@@ -11503,6 +11550,26 @@ static void buildDeviceSettings(int sec) {
     y += settingsRowLabel(body, y, 0, "tap to cycle off / on / auto", COLOR_SUB, &g_font_12, 0) + 2;
   }
 #endif
+
+#if CAP_KEYBOARD && CAP_TOUCH
+  /* On-screen keyboard (opt-in). This board has both a physical keyboard and a
+     touchscreen; enable this to also get the tap-to-type on-screen keyboard when a
+     text field is tapped — useful when the mechanical keyboard is unreliable. The
+     physical keyboard keeps working either way. Default off. */
+  {
+    int h = settingsRowLabel(body, y, 4, TR("On-screen keyboard"), COLOR_TEXT, &g_font_12, 56);
+    lv_obj_t* sw = lv_switch_create(body);
+    lv_obj_align(sw, LV_ALIGN_TOP_RIGHT, 0, y);
+#if defined(ESP32)
+    if (touchPrefsGetOsk()) lv_obj_add_state(sw, LV_STATE_CHECKED);
+#endif
+    lv_obj_add_event_cb(sw, oskToggleCb, LV_EVENT_VALUE_CHANGED, nullptr);
+    y += LV_MAX(34, h + 10);
+    y += settingsRowLabel(body, y, 0, TR("tap a text field to pop up an on-screen keyboard; the physical keyboard still works"),
+                          COLOR_SUB, &g_font_12, 0) + 2;
+  }
+#endif
+
   /* Secondary keyboards (multi-select). Switch on any layouts you want in the
      rotation; a double-tap of SPACE on the physical keyboard cycles
      English -> each enabled layout -> back. The active layout is remembered
@@ -28518,7 +28585,7 @@ static void makeChatDetail(LvChatPanel& p) {
   // Grow / shrink the composer row as the message wraps (every text change).
   lv_obj_add_event_cb(p.composer_ta, composerAutoGrowCb, LV_EVENT_VALUE_CHANGED, &p);
   // Double-tap a word to select it; long-press for Cut/Copy/Paste/Select-All.
-  lv_obj_add_event_cb(p.composer_ta, composerEditClickedCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_add_event_cb(p.composer_ta, composerEditClickedCb, LV_EVENT_CLICKED, &p);
   lv_obj_add_event_cb(p.composer_ta, composerEditLongPressCb, LV_EVENT_LONG_PRESSED, nullptr);
 
   lv_obj_t* send = lv_btn_create(p.composer_row);
@@ -43365,6 +43432,9 @@ void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* no
 #endif
 #if CAP_KEYBOARD
     s_kb_bl_mode = touchPrefsGetKbBacklight();
+#endif
+#if CAP_KEYBOARD && CAP_TOUCH
+    s_osk_enabled = touchPrefsGetOsk();   // opt-in on-screen keyboard (physical-keyboard + touch board)
 #endif
 #if defined(HAS_TDECK_KEYBOARD)
     { uint8_t p = touchPrefsGetKbdBacklight(); s_tdeck_kb_bl_pct = (p < 1) ? 1 : (p > 100 ? 100 : p); }   // shared kbd_bl pref (dark = mode off, not pct 0)

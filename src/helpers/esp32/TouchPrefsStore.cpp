@@ -1775,6 +1775,8 @@ uint8_t touchPrefsGetDiscoveredMaxHops() {
 void touchPrefsSetDiscoveredMaxHops(uint8_t hops) { if (!s_begun) touchPrefsBegin(); prefsPutUChar("dsc_hops", hops); }
 bool touchPrefsGetEnterSends()      { if (!s_begun) touchPrefsBegin(); return s_prefs.getUChar("ent_send", 1) != 0; }
 void touchPrefsSetEnterSends(bool on)      { if (!s_begun) touchPrefsBegin(); prefsPutUChar("ent_send", on ? 1 : 0); }
+bool touchPrefsGetOsk()             { if (!s_begun) touchPrefsBegin(); return s_prefs.getUChar("osk_en", 0) != 0; }
+void touchPrefsSetOsk(bool on)             { if (!s_begun) touchPrefsBegin(); prefsPutUChar("osk_en", on ? 1 : 0); }
 bool touchPrefsGetClock12h()        { if (!s_begun) touchPrefsBegin(); return s_prefs.getUChar("clk_12h", 0) != 0; }
 void touchPrefsSetClock12h(bool on)        { if (!s_begun) touchPrefsBegin(); prefsPutUChar("clk_12h", on ? 1 : 0); }
 bool touchPrefsGetNavMenubarKeys()         { if (!s_begun) touchPrefsBegin(); return s_prefs.getUChar("nav_mbk", 0) != 0; }
